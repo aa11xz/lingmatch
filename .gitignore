@@ -2,5 +2,9 @@ node_modules/
 .npm-cache/
 dist/
 coverage/
+artifacts/
+*.apk
+*.jks
+*.keystore
 *.log
 .DS_Store

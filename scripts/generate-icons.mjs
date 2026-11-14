@@ -17,3 +17,8 @@ async function writeIcon(size, filename) {
 await writeIcon(192, 'icon-192.png')
 await writeIcon(512, 'icon-512.png')
 await writeIcon(512, 'icon-512-maskable.png')
+
+const nativeMark = await sharp(iconSvg).resize(573, 573).png().toBuffer()
+await sharp({
+  create: { width: 1024, height: 1024, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+}).composite([{ input: nativeMark, gravity: 'centre' }]).png().toFile(fileURLToPath(new URL('../assets/icon.png', import.meta.url)))

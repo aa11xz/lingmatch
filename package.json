@@ -9,9 +9,13 @@
     "preview": "vite preview --host 0.0.0.0",
     "test": "vitest run",
     "test:watch": "vitest",
-    "icons:generate": "node scripts/generate-icons.mjs"
+    "icons:generate": "node scripts/generate-icons.mjs",
+    "android:assets": "capacitor-assets generate --android --iconBackgroundColor \"#e8f6ee\" --splashBackgroundColor \"#f5f7f3\"",
+    "android:sync": "npm run build && cap sync android"
   },
   "dependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/core": "^8.6.2",
     "dexie": "^4.2.1",
     "framer-motion": "^12.23.24",
     "lucide-react": "^0.468.0",
@@ -23,6 +27,8 @@
     "zustand": "^5.0.8"
   },
   "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^8.6.2",
     "@tailwindcss/vite": "^4.1.14",
     "@types/papaparse": "^5.3.16",
     "@types/react": "^19.2.2",
