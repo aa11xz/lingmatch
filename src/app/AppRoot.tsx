@@ -8,8 +8,19 @@ import {
   renameLibrary as renameLibraryService,
   replaceLibraryWords as replaceLibraryWordsService,
 } from '../features/library/libraryService'
+import {
+  completeStudyRound,
+  createStudyTask,
+  getLearningProfiles,
+  getLearningStats,
+  getResumableStudyTask,
+  pauseStudyTask,
+  recordPairResolution,
+  resumeStudyTask,
+  setWordLearningStatus,
+} from '../features/learning/learningService'
 import { useAppStore } from '../stores/appStore'
-import type { WordPairDraft } from '../types/domain'
+import type { PairCount, ReviewRating, StudyTaskMode, WordLearningStatus, WordPairDraft } from '../types/domain'
 
 export function AppRoot() {
   const libraries = useAppStore((state) => state.libraries)
@@ -41,6 +52,22 @@ export function AppRoot() {
       await deleteLibraryService(id)
       await Promise.all([refreshLibraries(), refreshHistory()])
     },
+    createStudyTask(libraryId: string, mode: StudyTaskMode, roundSize: PairCount, targetCount = 50) {
+      return createStudyTask({ libraryId, mode, roundSize, targetCount })
+    },
+    resumeStudyTask,
+    pauseStudyTask,
+    recordPairResolution,
+    async completeStudyRound(taskId: string, roundNumber: number, ratings: Record<string, ReviewRating>, durationSeconds: number) {
+      const result = await completeStudyRound({ taskId, roundNumber, ratings, durationSeconds })
+      await refreshHistory()
+      return result
+    },
+    getLearningStats,
+    getLearningProfiles,
+    setWordLearningStatus(wordId: string, status: WordLearningStatus) {
+      return setWordLearningStatus(wordId, status)
+    },
   }), [refreshHistory, refreshLibraries])
 
   useEffect(() => {
@@ -63,6 +90,15 @@ export function AppRoot() {
       deleteLibrary={callbacks.deleteLibrary}
       saveSettings={persistSettings}
       saveResult={persistResult}
+      createStudyTask={callbacks.createStudyTask}
+      resumeStudyTask={callbacks.resumeStudyTask}
+      pauseStudyTask={callbacks.pauseStudyTask}
+      recordPairResolution={callbacks.recordPairResolution}
+      completeStudyRound={callbacks.completeStudyRound}
+      getResumableStudyTask={getResumableStudyTask}
+      getLearningStats={callbacks.getLearningStats}
+      getLearningProfiles={callbacks.getLearningProfiles}
+      setWordLearningStatus={callbacks.setWordLearningStatus}
       theme={theme}
       saveTheme={persistTheme}
     />

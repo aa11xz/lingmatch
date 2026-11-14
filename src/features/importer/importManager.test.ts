@@ -108,6 +108,36 @@ describe('local import parsing', () => {
     ])
   })
 
+  it('keeps a continued TXT definition and an incomplete row visible', async () => {
+    const result = await parseImportFile(makeFile('continued.txt', 'Apple | 水果\n也可以指苹果公司\nBook | 书\nOrphan'))
+    expect(result.words).toEqual([
+      { english: 'Apple', chinese: '水果 也可以指苹果公司' },
+      { english: 'Book', chinese: '书' },
+      { english: 'Orphan', chinese: '' },
+    ])
+    expect(result.sourceRows).toHaveLength(3)
+    expect(result.warnings.some((warning) => warning.includes('缺少英文或中文'))).toBe(true)
+  })
+
+  it('parses loose numbered bilingual TXT and retains an unmatched last item', async () => {
+    const result = await parseImportFile(makeFile('loose.txt', '1. Apple 苹果\n一种常见水果\n2. Book'))
+    expect(result.words).toEqual([
+      { english: 'Apple', chinese: '苹果 一种常见水果' },
+      { english: 'Book', chinese: '' },
+    ])
+    expect(result.warnings.some((warning) => warning.includes('缺少英文或中文'))).toBe(true)
+  })
+
+  it('preserves incomplete CSV rows and reports extra fields', async () => {
+    const result = await parseImportFile(makeFile('partial.csv', 'English,Chinese\nApple,\nBook,书,额外说明'))
+    expect(result.words).toEqual([
+      { english: 'Apple', chinese: '' },
+      { english: 'Book', chinese: '书' },
+    ])
+    expect(result.sourceRows).toHaveLength(3)
+    expect(result.warnings.some((warning) => warning.includes('格式异常'))).toBe(true)
+  })
+
   it('loads XLSX and XLS locally and exposes sheet names for selection', async () => {
     const workbook = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([['English', 'Chinese'], ['Apple', '苹果']]), 'Vocabulary')
@@ -121,14 +151,16 @@ describe('local import parsing', () => {
     }
   })
 
-  it('extracts text from a PDF locally and keeps adjacent word pairs in order', async () => {
-    const result = await parseImportFile(makeTextPdf(['Apple', '苹果', 'Book', '书']))
+  it('extracts text from a PDF locally and pairs bilingual lines without discarding a final orphan', async () => {
+    const result = await parseImportFile(makeTextPdf(['Apple', '苹果', 'Book', '书', 'final note']))
     expect(result.format).toBe('pdf')
     expect(result.words).toEqual([
       { english: 'Apple', chinese: '苹果' },
       { english: 'Book', chinese: '书' },
+      { english: 'final note', chinese: '' },
     ])
-    expect(result.warnings[0]).toContain('相邻两行')
+    expect(result.warnings.some((warning) => warning.includes('版面启发式'))).toBe(true)
+    expect(result.warnings.some((warning) => warning.includes('缺少英文或中文'))).toBe(true)
   }, 15000)
 
   it('reports duplicate pairs while retaining both rows for the user to choose', async () => {

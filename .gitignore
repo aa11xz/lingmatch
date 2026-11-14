@@ -1,5 +1,6 @@
 node_modules/
 .npm-cache/
+.local-tools/
 dist/
 coverage/
 artifacts/

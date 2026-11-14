@@ -6,6 +6,7 @@ export interface WordEntry {
   chinese: string
   libraryId: string
   createdAt: number
+  archivedAt?: number
 }
 
 export interface WordLibrary {
@@ -31,6 +32,75 @@ export interface GameResult {
   duration: number
   completedAt: number
   mistakes?: number
+  taskId?: string
+  roundNumber?: number
+  mode?: PracticeMode
+}
+
+export type WordLearningStatus = 'unlearned' | 'learning' | 'fuzzy' | 'familiar' | 'mastered'
+export type PracticeMode = 'match' | 'flashcard' | 'multipleChoice' | 'spelling' | 'listening'
+export type StudyTaskMode = 'new' | 'wrong' | 'due' | 'mixed' | 'all' | 'weak'
+export type ReviewRating = 'forgotten' | 'uncertain' | 'remembered'
+export type StudyTaskStatus = 'in-progress' | 'completed' | 'paused'
+
+export interface WordLearningProfile {
+  wordId: string
+  libraryId: string
+  status: WordLearningStatus
+  statusSource: 'system' | 'manual'
+  correctCount: number
+  incorrectCount: number
+  consecutiveCorrect: number
+  repetitions: number
+  intervalDays: number
+  easeFactor: number
+  lastPracticedAt: number | null
+  lastIncorrectAt: number | null
+  nextReviewAt: number | null
+  updatedAt: number
+}
+
+export interface PracticeEvent {
+  id: string
+  wordId: string
+  libraryId: string
+  taskId: string
+  roundId: string
+  roundNumber: number
+  mode: PracticeMode
+  correct: boolean
+  misses: number
+  rating: ReviewRating
+  practicedAt: number
+}
+
+export interface StudyTask {
+  id: string
+  libraryId: string
+  mode: StudyTaskMode
+  practiceMode: PracticeMode
+  status: StudyTaskStatus
+  targetCount: number
+  roundSize: PairCount
+  plannedWordIds: string[]
+  completedWordIds: string[]
+  reviewQueueWordIds: string[]
+  reviewedWordIds: string[]
+  currentRoundWordIds: string[]
+  currentMissesByWord: Record<string, number>
+  currentMatchedWordIds: string[]
+  roundNumber: number
+  durationSeconds: number
+  totalMistakes: number
+  startedAt: number
+  completedAt: number | null
+  updatedAt: number
+}
+
+export interface WordReviewOutcome {
+  wordId: string
+  misses: number
+  rating: ReviewRating
 }
 
 export type AppTheme = 'light' | 'dark'
@@ -67,6 +137,17 @@ export interface ParsedImport {
   hasHeader: boolean
   suggestedEnglishColumn?: number
   suggestedChineseColumn?: number
+}
+
+export interface LearningStats {
+  total: number
+  unlearned: number
+  learning: number
+  fuzzy: number
+  familiar: number
+  mastered: number
+  due: number
+  weak: number
 }
 
 export const DEFAULT_GAME_SETTINGS: GameSettings = {
