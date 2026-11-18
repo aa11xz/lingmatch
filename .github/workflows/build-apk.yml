@@ -105,7 +105,8 @@ jobs:
             exit 1
           fi
           VERIFY_OUTPUT="$("$APKSIGNER" verify --verbose --print-certs "$APK_PATH" 2>&1)"
-          SIGNER_FINGERPRINTS="$(printf '%s\n' "$VERIFY_OUTPUT" | grep -Eio '^Signer #[0-9]+ certificate SHA-256 digest: [0-9a-f:]+' | sed -E 's/^Signer #[0-9]+ certificate SHA-256 digest: //I' | tr '[:upper:]' '[:lower:]' | tr -d ':')"
+          SIGNER_LINES="$(printf '%s\n' "$VERIFY_OUTPUT" | grep -Ei '^Signer #[0-9]+ certificate SHA-256 digest: [0-9a-f:]+' || true)"
+          SIGNER_FINGERPRINTS="$(printf '%s\n' "$SIGNER_LINES" | sed -E 's/^Signer #[0-9]+ certificate SHA-256 digest: //I' | tr '[:upper:]' '[:lower:]' | tr -d ':')"
           SIGNER_COUNT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
           if [[ "$SIGNER_COUNT" != "1" ]]; then
             echo "Expected exactly one APK signer certificate, found $SIGNER_COUNT."
