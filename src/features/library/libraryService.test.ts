@@ -2,8 +2,8 @@ import 'fake-indexeddb/auto'
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { db } from '../../db/database'
 import { DEFAULT_GAME_SETTINGS } from '../../types/domain'
-import { createStudyTask, getLearningProfiles, getWordPracticeHistory, setWordLearningStatus } from '../learning/learningService'
-import { createLibrary, deleteLibrary, getLibraries, getRecentResults, listWords, loadSettings, loadTheme, renameLibrary, replaceLibraryWords, saveGameResult, saveSettings, saveTheme } from './libraryService'
+import { completeStudyRound, createStudyTask, getLearningProgress, getWordPracticeHistory, recordPairResolution } from '../learning/learningService'
+import { createLibrary, deleteLibrary, getLibraries, getRecentResults, listWords, loadSettings, loadTheme, renameLibrary, replaceLibraryWords, saveSettings, saveTheme } from './libraryService'
 
 beforeEach(async () => {
   await db.delete()
@@ -43,29 +43,36 @@ describe('local library persistence', () => {
       { english: 'Grape', chinese: '葡萄' },
     ])
 
-    const result = { id: 'result-1', libraryId: library.id, totalPairs: 2, correctPairs: 2, duration: 12, completedAt: 20, mistakes: 1 }
-    await saveGameResult(result)
-    const task = await createStudyTask({ libraryId: library.id, mode: 'all', roundSize: 4 })
-    const taskWordId = task.task.currentRoundWordIds[0]!
-    await db.practiceEvents.add({
-      id: 'practice-delete-1',
-      wordId: taskWordId,
-      libraryId: library.id,
+    const task = await createStudyTask({ libraryId: library.id, mode: 'comprehensive', roundSize: 4 })
+    for (const wordId of task.task.currentRoundWordIds) {
+      await recordPairResolution({
+        taskId: task.task.id,
+        roundNumber: task.task.roundNumber,
+        englishWordId: wordId,
+        chineseWordId: wordId,
+        correct: true,
+      })
+    }
+    const completed = await completeStudyRound({
       taskId: task.task.id,
-      roundId: `${task.task.id}:round:1`,
-      roundNumber: 1,
-      mode: 'match',
-      correct: true,
-      misses: 0,
-      rating: 'remembered',
-      practicedAt: 21,
+      roundNumber: task.task.roundNumber,
+      durationSeconds: 12,
+      timestamp: 20,
     })
-    expect(await getRecentResults()).toEqual([result])
+    expect(completed.task.status).toBe('completed')
+    expect(completed.result).toMatchObject({
+      libraryId: library.id,
+      totalPairs: 2,
+      correctPairs: 2,
+      duration: 12,
+      completedAt: 20,
+    })
+    expect(await getRecentResults()).toEqual([completed.result])
     await deleteLibrary(library.id)
     expect(await getLibraries()).toEqual([])
     expect(await listWords(library.id)).toEqual([])
     expect(await getRecentResults()).toEqual([])
-    expect(await getLearningProfiles(library.id)).toEqual([])
+    expect(await getLearningProgress(library.id)).toEqual([])
     expect(await db.practiceEvents.count()).toBe(0)
     expect(await db.studyTasks.count()).toBe(0)
   })
@@ -78,18 +85,17 @@ describe('local library persistence', () => {
     const originalWords = await listWords(library.id)
     const apple = originalWords[0]!
     const book = originalWords[1]!
-    await setWordLearningStatus(apple.id, 'mastered')
+    const appleProgress = await db.wordProgress.get(apple.id)
+    await db.wordProgress.put({ ...appleProgress!, state: 'mastered' })
     await db.practiceEvents.add({
       id: 'practice-apple-1',
       wordId: apple.id,
       libraryId: library.id,
       taskId: 'old-task',
       roundId: 'old-task:round:1',
-      roundNumber: 1,
-      mode: 'match',
-      correct: true,
-      misses: 0,
-      rating: 'remembered',
+      mode: 'comprehensive',
+      mistakes: 0,
+      firstTryCorrect: true,
       practicedAt: 500,
     })
 
@@ -103,11 +109,11 @@ describe('local library persistence', () => {
     const currentBook = currentWords.find((word) => word.english === 'Book')!
     expect(currentApple.id).toBe(apple.id)
     expect(currentBook.id).not.toBe(book.id)
-    expect((await getLearningProfiles(library.id)).find((profile) => profile.wordId === apple.id)?.status).toBe('mastered')
-    expect((await getLearningProfiles(library.id)).find((profile) => profile.wordId === currentBook.id)?.status).toBe('unlearned')
+    expect((await getLearningProgress(library.id)).find((profile) => profile.wordId === apple.id)?.state).toBe('mastered')
+    expect((await getLearningProgress(library.id)).find((profile) => profile.wordId === currentBook.id)?.state).toBe('new')
     expect(await getWordPracticeHistory(apple.id)).toMatchObject([{ id: 'practice-apple-1', wordId: apple.id }])
     expect((await db.words.get(book.id))?.archivedAt).toBeTypeOf('number')
-    expect((await getLearningProfiles(library.id)).some((profile) => profile.wordId === book.id)).toBe(true)
+    expect((await getLearningProgress(library.id)).some((profile) => profile.wordId === book.id)).toBe(true)
   })
 
   it('matches duplicate exact pairs in stable creation order during replacement', async () => {
@@ -116,16 +122,18 @@ describe('local library persistence', () => {
     const original = await listWords(library.id)
     const first = original[0]!
     const second = original[1]!
-    await setWordLearningStatus(first.id, 'fuzzy')
-    await setWordLearningStatus(second.id, 'familiar')
+    const firstProgress = await db.wordProgress.get(first.id)
+    const secondProgress = await db.wordProgress.get(second.id)
+    await db.wordProgress.put({ ...firstProgress!, state: 'weak' })
+    await db.wordProgress.put({ ...secondProgress!, state: 'familiar' })
 
     await replaceLibraryWords(library.id, [pair, pair])
 
     const replaced = await listWords(library.id)
-    const profiles = new Map((await getLearningProfiles(library.id)).map((profile) => [profile.wordId, profile.status]))
+    const progress = new Map((await getLearningProgress(library.id)).map((profile) => [profile.wordId, profile.state]))
     expect(replaced.map((word) => word.id)).toEqual([first.id, second.id])
-    expect(profiles.get(first.id)).toBe('fuzzy')
-    expect(profiles.get(second.id)).toBe('familiar')
+    expect(progress.get(first.id)).toBe('weak')
+    expect(progress.get(second.id)).toBe('familiar')
   })
 
   it('rejects incomplete rows instead of silently dropping them', async () => {

@@ -1,6 +1,6 @@
 import { db } from '../../db/database'
 import { DEFAULT_GAME_SETTINGS, type AppTheme, type GameResult, type GameSettings, type WordEntry, type WordLibrary, type WordPairDraft } from '../../types/domain'
-import { createDefaultLearningProfile } from '../learning/learningEngine'
+import { createDefaultWordProgress } from '../learning/learningEngine'
 
 const now = () => Date.now()
 const makeId = () => crypto.randomUUID()
@@ -42,11 +42,11 @@ export async function createLibrary(name: string, drafts: WordPairDraft[] = []):
   }
   const words = clean.map((entry, index): WordEntry => ({ ...entry, id: makeId(), libraryId: library.id, createdAt: timestamp + index }))
 
-  const profiles = words.map((word) => createDefaultLearningProfile(word, timestamp))
-  await db.transaction('rw', db.libraries, db.words, db.learningProfiles, async () => {
+  const progress = words.map((word) => createDefaultWordProgress(word, timestamp))
+  await db.transaction('rw', db.libraries, db.words, db.wordProgress, async () => {
     await db.libraries.add(library)
     if (words.length) await db.words.bulkAdd(words)
-    if (profiles.length) await db.learningProfiles.bulkAdd(profiles)
+    if (progress.length) await db.wordProgress.bulkAdd(progress)
   })
   return library
 }
@@ -61,7 +61,7 @@ export async function renameLibrary(libraryId: string, name: string): Promise<vo
 export async function replaceLibraryWords(libraryId: string, drafts: WordPairDraft[]): Promise<void> {
   const clean = cleanDrafts(drafts)
   const timestamp = now()
-  await db.transaction('rw', db.libraries, db.words, db.learningProfiles, async () => {
+  await db.transaction('rw', db.libraries, db.words, db.wordProgress, async () => {
     const library = await db.libraries.get(libraryId)
     if (!library) throw new Error('找不到要替换词条的词库。')
     const existing = await db.words.where('libraryId').equals(libraryId).toArray()
@@ -82,7 +82,7 @@ export async function replaceLibraryWords(libraryId: string, drafts: WordPairDra
         : { ...entry, id: makeId(), libraryId, createdAt: timestamp + index }
       retainedIds.add(word.id)
       nextWords.push(word)
-      if (!matched) await db.learningProfiles.add(createDefaultLearningProfile(word, timestamp))
+      if (!matched) await db.wordProgress.add(createDefaultWordProgress(word, timestamp))
     }
     const archivedWords = existing
       .filter((word) => !retainedIds.has(word.id) && word.archivedAt === undefined)
@@ -94,10 +94,10 @@ export async function replaceLibraryWords(libraryId: string, drafts: WordPairDra
 }
 
 export async function deleteLibrary(libraryId: string): Promise<void> {
-  await db.transaction('rw', [db.libraries, db.words, db.results, db.learningProfiles, db.practiceEvents, db.studyTasks], async () => {
+  await db.transaction('rw', [db.libraries, db.words, db.results, db.wordProgress, db.practiceEvents, db.studyTasks], async () => {
     await db.words.where('libraryId').equals(libraryId).delete()
     await db.results.where('libraryId').equals(libraryId).delete()
-    await db.learningProfiles.where('libraryId').equals(libraryId).delete()
+    await db.wordProgress.where('libraryId').equals(libraryId).delete()
     await db.practiceEvents.where('libraryId').equals(libraryId).delete()
     await db.studyTasks.where('libraryId').equals(libraryId).delete()
     await db.libraries.delete(libraryId)
@@ -119,10 +119,6 @@ export async function loadTheme(): Promise<AppTheme> {
 
 export async function saveTheme(theme: AppTheme): Promise<void> {
   await db.preferences.put({ key: 'theme', value: theme })
-}
-
-export async function saveGameResult(result: GameResult): Promise<void> {
-  await db.results.put(result)
 }
 
 export async function getRecentResults(limit = 20): Promise<GameResult[]> {

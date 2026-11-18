@@ -1,6 +1,13 @@
 apply plugin: 'com.android.application'
 
 def localDebugKeystore = rootProject.file('../.local-tools/debug.keystore')
+def lingMatchVersionCode = (project.findProperty('lingmatchVersionCode') ?: System.getenv('LINGMATCH_VERSION_CODE') ?: '5').toString().toInteger()
+def lingMatchVersionName = (project.findProperty('lingmatchVersionName') ?: System.getenv('LINGMATCH_VERSION_NAME') ?: '2.0.3').toString()
+def releaseKeystorePath = System.getenv('LINGMATCH_KEYSTORE_PATH')
+def releaseSigningProperties = new Properties()
+rootProject.file('gradle.properties').withInputStream { input -> releaseSigningProperties.load(input) }
+def pinnedReleaseCertificateSha256 = releaseSigningProperties.getProperty('lingmatchExpectedCertSha256')
+def configuredReleaseCertificateSha256 = System.getenv('LINGMATCH_EXPECTED_CERT_SHA256')
 
 android {
     namespace = "com.aa11xz.lingmatch"
@@ -9,8 +16,8 @@ android {
         applicationId "com.aa11xz.lingmatch"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode lingMatchVersionCode
+        versionName lingMatchVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -27,12 +34,89 @@ android {
                 keyPassword 'android'
             }
         }
+        release {
+            if (releaseKeystorePath) {
+                storeFile file(releaseKeystorePath)
+                storePassword System.getenv('LINGMATCH_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('LINGMATCH_KEY_ALIAS')
+                keyPassword System.getenv('LINGMATCH_KEY_PASSWORD')
+            }
+        }
     }
     buildTypes {
         release {
+            signingConfig signingConfigs.release
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
+    }
+}
+
+def verifyLingMatchReleaseSigning = tasks.register('verifyLingMatchReleaseSigning') {
+    doLast {
+        def requiredVariables = [
+            'LINGMATCH_KEYSTORE_PATH',
+            'LINGMATCH_KEY_ALIAS',
+            'LINGMATCH_KEYSTORE_PASSWORD',
+            'LINGMATCH_KEY_PASSWORD',
+        ]
+        def missingVariables = requiredVariables.findAll { !System.getenv(it) }
+        if (missingVariables || !releaseKeystorePath || !file(releaseKeystorePath).isFile()) {
+            throw new GradleException('Release signing is not configured. Set the verified persistent key and confirmed certificate SHA-256 before building.')
+        }
+
+        if (!pinnedReleaseCertificateSha256) {
+            throw new GradleException('The confirmed release certificate SHA-256 pin is missing from android/gradle.properties.')
+        }
+        def normalizedExpected = pinnedReleaseCertificateSha256.replaceAll('[:\\s]', '')
+        if (!(normalizedExpected ==~ /(?i)[0-9a-f]{64}/)) {
+            throw new GradleException('lingmatchExpectedCertSha256 must contain a 64-character SHA-256 certificate fingerprint.')
+        }
+        if (configuredReleaseCertificateSha256 && !configuredReleaseCertificateSha256.replaceAll('[:\\s]', '').equalsIgnoreCase(normalizedExpected)) {
+            throw new GradleException('LINGMATCH_EXPECTED_CERT_SHA256 does not match the certificate pin in android/gradle.properties.')
+        }
+
+        def storePassword = System.getenv('LINGMATCH_KEYSTORE_PASSWORD')
+        def keyPassword = System.getenv('LINGMATCH_KEY_PASSWORD')
+        def keyAlias = System.getenv('LINGMATCH_KEY_ALIAS')
+        def keyStoreFile = file(releaseKeystorePath)
+        def releaseKeyStore = null
+        ['PKCS12', 'JKS'].each { storeType ->
+            if (releaseKeyStore == null) {
+                try {
+                    def candidate = java.security.KeyStore.getInstance(storeType)
+                    new FileInputStream(keyStoreFile).withCloseable { input ->
+                        candidate.load(input, storePassword.toCharArray())
+                    }
+                    releaseKeyStore = candidate
+                } catch (Exception ignored) {
+                    // Try the other common Android signing keystore format.
+                }
+            }
+        }
+        if (releaseKeyStore == null || !releaseKeyStore.isKeyEntry(keyAlias)) {
+            throw new GradleException('The configured release keystore could not be opened or does not contain the configured private-key alias.')
+        }
+
+        def privateKey = releaseKeyStore.getKey(keyAlias, keyPassword.toCharArray())
+        def certificate = releaseKeyStore.getCertificate(keyAlias)
+        if (privateKey == null || certificate == null) {
+            throw new GradleException('The configured release alias does not provide a private key and signing certificate.')
+        }
+
+        def actualFingerprint = java.security.MessageDigest.getInstance('SHA-256')
+            .digest(certificate.encoded)
+            .collect { String.format('%02x', it & 0xff) }
+            .join()
+        if (!actualFingerprint.equalsIgnoreCase(normalizedExpected)) {
+            throw new GradleException("Release keystore certificate fingerprint mismatch. Expected ${normalizedExpected}, got ${actualFingerprint}.")
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name == 'preReleaseBuild') {
+        dependsOn(verifyLingMatchReleaseSigning)
     }
 }
 

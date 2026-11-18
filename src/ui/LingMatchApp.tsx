@@ -9,6 +9,7 @@ import {
   ChevronRight,
   CircleHelp,
   Clock3,
+  Download,
   FileSpreadsheet,
   FileText,
   FolderOpen,
@@ -36,22 +37,22 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type {
-  LearningStats,
   GameResult,
   GameSettings,
   ImportOptions,
   ParsedImport,
   PairCount,
-  ReviewRating,
   StudyTask,
   StudyTaskMode,
   WordEntry,
-  WordLearningProfile,
-  WordLearningStatus,
+  WordProgress,
+  WordProgressState,
   WordLibrary,
   WordPairDraft,
 } from "../types/domain";
-import type { CompletedRoundResult, StudyTaskBundle } from "../features/learning/learningService";
+import type { CompletedRoundResult, LearningDashboard, StudyTaskBundle } from "../features/learning/learningService";
+import { parseLingMatchBackup } from "../features/backup/backupService";
+import type { LingMatchBackup, RestoreStrategy, RestoreSummary } from "../features/backup/backupService";
 import { LEARNING_STATUS_LABELS } from "../features/learning/learningEngine";
 import { prepareMatchRound, type MatchCardItem } from "../features/matching/matchingEngine";
 import "./lingmatch.css";
@@ -59,6 +60,17 @@ import "./lingmatch.css";
 type Screen = "home" | "library" | "import" | "game";
 type Theme = "light" | "dark";
 type Delimiter = NonNullable<ImportOptions["delimiter"]>;
+
+const STUDY_MODE_LABELS: Record<StudyTaskMode, string> = {
+  new: "新词学习",
+  weak: "薄弱词强化",
+  due: "今日复习",
+  comprehensive: "全词库智能练习",
+};
+
+function getStudyTaskProgress(task: StudyTask): string {
+  return `已完成 ${task.completedWordIds.length} / ${task.plannedWordIds.length} 个计划词`
+}
 
 export interface LingMatchAppProps {
   libraries: WordLibrary[];
@@ -71,16 +83,15 @@ export interface LingMatchAppProps {
   renameLibrary(id: string, name: string): Promise<void>;
   deleteLibrary(id: string): Promise<void>;
   saveSettings(settings: GameSettings): Promise<void>;
-  saveResult(result: GameResult): Promise<void>;
   createStudyTask(libraryId: string, mode: StudyTaskMode, roundSize: PairCount, targetCount?: number): Promise<StudyTaskBundle>;
   resumeStudyTask(taskId: string): Promise<StudyTaskBundle>;
   pauseStudyTask(taskId: string): Promise<void>;
   recordPairResolution(input: { taskId: string; roundNumber: number; englishWordId: string; chineseWordId: string; correct: boolean }): Promise<StudyTask>;
-  completeStudyRound(taskId: string, roundNumber: number, ratings: Record<string, ReviewRating>, durationSeconds: number): Promise<CompletedRoundResult>;
-  getResumableStudyTask(libraryId?: string): Promise<StudyTask | undefined>;
-  getLearningStats(libraryId: string): Promise<LearningStats>;
-  getLearningProfiles(libraryId: string): Promise<WordLearningProfile[]>;
-  setWordLearningStatus(wordId: string, status: WordLearningStatus): Promise<WordLearningProfile>;
+  completeStudyRound(taskId: string, roundNumber: number, durationSeconds: number): Promise<CompletedRoundResult>;
+  getLearningDashboard(libraryId: string): Promise<LearningDashboard>;
+  getLearningProgress(libraryId: string): Promise<WordProgress[]>;
+  exportBackup(): Promise<LingMatchBackup>;
+  restoreBackup(backup: unknown, strategy: RestoreStrategy): Promise<RestoreSummary>;
   theme?: Theme;
   saveTheme?(theme: Theme): Promise<void>;
 }
@@ -121,8 +132,7 @@ export function LingMatchApp(props: LingMatchAppProps) {
   const [theme, setTheme] = useState<Theme>(props.theme ?? "light");
   const [gameWords, setGameWords] = useState<WordEntry[]>([]);
   const [studyTask, setStudyTask] = useState<StudyTask | undefined>();
-  const [resumableTask, setResumableTask] = useState<StudyTask | undefined>();
-  const [learningStats, setLearningStats] = useState<LearningStats | undefined>();
+  const [learningDashboard, setLearningDashboard] = useState<LearningDashboard | undefined>();
   const [replaceTargetId, setReplaceTargetId] = useState("");
   const [gameSeed, setGameSeed] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -157,28 +167,27 @@ export function LingMatchApp(props: LingMatchAppProps) {
   }, [props.libraries]);
 
   const activeLibrary = props.libraries.find((library) => library.id === selectedLibraryId);
-  const loadLearningStats = props.getLearningStats;
-  const loadResumableTask = props.getResumableStudyTask;
+  const resumableTask = learningDashboard?.resumableTask;
+  const unfinishedTasks = learningDashboard?.unfinishedTasks ?? [];
+  const loadLearningDashboard = props.getLearningDashboard;
   const openImport = (libraryId = "") => { setReplaceTargetId(libraryId); setScreen("import"); };
 
   useEffect(() => {
     let cancelled = false;
     if (!activeLibrary) {
-      setLearningStats(undefined);
-      setResumableTask(undefined);
+      setLearningDashboard(undefined);
       return;
     }
-    void Promise.all([loadLearningStats(activeLibrary.id), loadResumableTask(activeLibrary.id)]).then(([stats, task]) => {
+    void loadLearningDashboard(activeLibrary.id).then((dashboard) => {
       if (cancelled) return;
-      setLearningStats(stats);
-      setResumableTask(task?.libraryId === activeLibrary.id ? task : undefined);
+      setLearningDashboard(dashboard);
     }).catch((cause) => {
       if (!cancelled) setAppError(cause instanceof Error ? cause.message : "暂时无法读取学习进度。");
     });
     return () => { cancelled = true; };
-  }, [activeLibrary?.id, screen, loadLearningStats, loadResumableTask]);
+  }, [activeLibrary?.id, screen, loadLearningDashboard]);
 
-  const handleStartGame = useCallback(async (mode: StudyTaskMode = "mixed") => {
+  const handleStartGame = useCallback(async (mode: StudyTaskMode = "comprehensive") => {
     if (!activeLibrary) {
       openImport();
       return;
@@ -186,11 +195,12 @@ export function LingMatchApp(props: LingMatchAppProps) {
     setBusy(true);
     setAppError("");
     try {
-      const bundle = await props.createStudyTask(activeLibrary.id, mode, props.settings.pairsPerRound, mode === "all" ? activeLibrary.wordCount : 50);
+      const bundle = await props.createStudyTask(activeLibrary.id, mode, props.settings.pairsPerRound);
       setStudyTask(bundle.task);
-      setResumableTask(bundle.task);
       setGameWords(bundle.words);
       setGameSeed((seed) => seed + 1);
+      const dashboard = await props.getLearningDashboard(activeLibrary.id);
+      setLearningDashboard(dashboard);
       setScreen("game");
     } catch (error) {
       setAppError(error instanceof Error ? error.message : "读取词库失败，请再试一次。");
@@ -199,40 +209,44 @@ export function LingMatchApp(props: LingMatchAppProps) {
     }
   }, [activeLibrary, props]);
 
-  const handleResumeGame = useCallback(async () => {
-    if (!resumableTask) return;
+  const handleResumeGame = useCallback(async (taskId = resumableTask?.id) => {
+    if (!taskId) return;
     setBusy(true);
     setAppError("");
     try {
-      const bundle = await props.resumeStudyTask(resumableTask.id);
+      const bundle = await props.resumeStudyTask(taskId);
       setStudyTask(bundle.task);
-      setResumableTask(bundle.task);
       setGameWords(bundle.words);
       setGameSeed((seed) => seed + 1);
+      const dashboard = await props.getLearningDashboard(bundle.task.libraryId);
+      setLearningDashboard(dashboard);
       setScreen("game");
     } catch (cause) {
       setAppError(cause instanceof Error ? cause.message : "恢复学习任务失败，请重试。");
     } finally {
       setBusy(false);
     }
-  }, [props, resumableTask]);
+  }, [props, resumableTask?.id]);
 
   const handlePauseGame = useCallback(async () => {
     if (studyTask) await props.pauseStudyTask(studyTask.id);
     setScreen("home");
-    setResumableTask(await props.getResumableStudyTask(studyTask?.libraryId));
+    if (studyTask) {
+      const dashboard = await props.getLearningDashboard(studyTask.libraryId);
+      setLearningDashboard(dashboard);
+    }
   }, [props, studyTask]);
 
-  const handleFinishRound = useCallback(async (ratings: Record<string, ReviewRating>, durationSeconds: number) => {
+  const handleFinishRound = useCallback(async (durationSeconds: number) => {
     if (!studyTask) throw new Error("找不到当前学习任务，请返回首页后继续。");
-    const result = await props.completeStudyRound(studyTask.id, studyTask.roundNumber, ratings, durationSeconds);
+    const result = await props.completeStudyRound(studyTask.id, studyTask.roundNumber, durationSeconds);
     setStudyTask(result.task);
-    setResumableTask(result.task.status === "completed" ? undefined : result.task);
     if (result.task.status !== "completed") {
       setGameWords(result.words);
       setGameSeed((seed) => seed + 1);
     }
-    setLearningStats(await props.getLearningStats(result.task.libraryId));
+    const dashboard = await props.getLearningDashboard(result.task.libraryId);
+    setLearningDashboard(dashboard);
     return result;
   }, [props, studyTask]);
 
@@ -280,8 +294,9 @@ export function LingMatchApp(props: LingMatchAppProps) {
                 selectedLibraryId={selectedLibraryId}
                 settings={props.settings ?? DEFAULT_SETTINGS}
                 history={props.history}
-                learningStats={learningStats}
+                learningDashboard={learningDashboard}
                 resumableTask={resumableTask}
+                unfinishedTasks={unfinishedTasks}
                 busy={busy}
                 onStart={handleStartGame}
                 onResume={handleResumeGame}
@@ -298,8 +313,7 @@ export function LingMatchApp(props: LingMatchAppProps) {
                 libraries={props.libraries}
                 selectedLibraryId={selectedLibraryId}
                 listWords={props.listWords}
-                getLearningProfiles={props.getLearningProfiles}
-                onSetWordLearningStatus={props.setWordLearningStatus}
+                getLearningProgress={props.getLearningProgress}
                 onSelect={setSelectedLibraryId}
                 onBack={() => setScreen("home")}
                 onImport={() => openImport()}
@@ -310,6 +324,8 @@ export function LingMatchApp(props: LingMatchAppProps) {
                   await props.deleteLibrary(id);
                   if (id === selectedLibraryId) setSelectedLibraryId("");
                 }}
+                exportBackup={props.exportBackup}
+                restoreBackup={props.restoreBackup}
               />
             </motion.div>
           )}
@@ -409,18 +425,19 @@ interface HomeScreenProps {
   selectedLibraryId: string;
   settings: GameSettings;
   history: GameResult[];
-  learningStats?: LearningStats;
+  learningDashboard?: LearningDashboard;
   resumableTask?: StudyTask;
+  unfinishedTasks: StudyTask[];
   busy: boolean;
   onStart: (mode?: StudyTaskMode) => void;
-  onResume: () => void;
+  onResume: (taskId?: string) => void;
   onImport: () => void;
   onLibrary: () => void;
   onSelectLibrary: (id: string) => void;
   onOpenSettings: () => void;
 }
 
-function HomeScreen({ libraries, activeLibrary, selectedLibraryId, settings, history, learningStats, resumableTask, busy, onStart, onResume, onImport, onLibrary, onSelectLibrary, onOpenSettings }: HomeScreenProps) {
+function HomeScreen({ libraries, activeLibrary, selectedLibraryId, settings, history, learningDashboard, resumableTask, unfinishedTasks, busy, onStart, onResume, onImport, onLibrary, onSelectLibrary, onOpenSettings }: HomeScreenProps) {
   const recentResults = history.filter((result) => result.libraryId === activeLibrary?.id).slice(0, 3);
   const count = activeLibrary?.wordCount ?? 0;
   return (
@@ -467,28 +484,32 @@ function HomeScreen({ libraries, activeLibrary, selectedLibraryId, settings, his
         </div>
       </div>
 
-      {activeLibrary && learningStats && <section className="lm-study-planner" aria-label="学习计划">
-        <div className="lm-section-heading"><div><span className="lm-eyebrow">按记忆状态安排</span><h2>今天学什么？</h2></div><span className="lm-planner-total"><strong>{learningStats.due}</strong> 个待复习</span></div>
+      {activeLibrary && learningDashboard && <section className="lm-study-planner" aria-label="学习计划">
+        <div className="lm-section-heading"><div><span className="lm-eyebrow">按当前学习状态安排</span><h2>今天学什么？</h2></div><span className="lm-planner-total"><strong>{learningDashboard.candidateWordCounts.due}</strong> 个待复习</span></div>
         <div className="lm-learning-snapshot">
-          <span>未学习 <strong>{learningStats.unlearned}</strong></span><i />
-          <span>学习中 <strong>{learningStats.learning}</strong></span><i />
-          <span>模糊 <strong>{learningStats.fuzzy}</strong></span><i />
-          <span>熟悉 <strong>{learningStats.familiar}</strong></span><i />
-          <span>掌握 <strong>{learningStats.mastered}</strong></span>
+          <span>未学习 <strong>{learningDashboard.stats.new}</strong></span><i />
+          <span>学习中 <strong>{learningDashboard.stats.learning}</strong></span><i />
+          <span>薄弱 <strong>{learningDashboard.stats.weak}</strong></span><i />
+          <span>熟悉 <strong>{learningDashboard.stats.familiar}</strong></span><i />
+          <span>掌握 <strong>{learningDashboard.stats.mastered}</strong></span>
         </div>
         <div className="lm-study-modes">
           {([
-            { mode: "due", title: "今日复习", count: learningStats.due, hint: "已到复习时间" },
-            { mode: "wrong", title: "错词强化", count: learningStats.weak, hint: "容易出错的词" },
-            { mode: "weak", title: "薄弱词训练", count: learningStats.weak, hint: "优先补足短板" },
-            { mode: "new", title: "新词学习", count: learningStats.unlearned, hint: "按计划逐步覆盖" },
-            { mode: "mixed", title: "混合练习", count: learningStats.total, hint: "按记忆优先级抽取" },
-            { mode: "all", title: "全词库测试", count: learningStats.total, hint: "完整检查整本词库" },
+            { mode: "due", title: "今日复习", count: learningDashboard.candidateWordCounts.due, hint: "只练已到期词" },
+            { mode: "weak", title: "薄弱词强化", count: learningDashboard.candidateWordCounts.weak, hint: "改善后自动退出候选" },
+            { mode: "new", title: "新词学习", count: learningDashboard.candidateWordCounts.new, hint: `本次安排 ${Math.min(50, learningDashboard.candidateWordCounts.new)} 个，最多 50 个` },
+            { mode: "comprehensive", title: "全词库智能练习", count: learningDashboard.candidateWordCounts.comprehensive, hint: "按记忆状态排序，完整覆盖" },
           ] as const).map((item) => <button className="lm-study-mode" key={item.mode} disabled={busy || item.count === 0} onClick={() => onStart(item.mode)}>
-            <strong>{item.title}</strong><span>{item.hint}</span><small>{item.count} 词</small>
+            <strong>{item.title}</strong><span>{item.hint}</span><small>{item.mode === "new" ? `${item.count} 可学` : `${item.count} 词`}</small>
           </button>)}
         </div>
-        {resumableTask && <button className="lm-resume-task" disabled={busy} onClick={onResume}><span><strong>继续上次学习</strong><small>已完成 {resumableTask.completedWordIds.length} / {resumableTask.plannedWordIds.length} 个计划词</small></span><ChevronRight size={18} /></button>}
+        {resumableTask && <button className="lm-resume-task" disabled={busy} onClick={() => onResume()}><span><strong>继续上次学习</strong><small>{getStudyTaskProgress(resumableTask)}</small></span><ChevronRight size={18} /></button>}
+        {unfinishedTasks.length > 1 && <div className="lm-task-switch-list" aria-label="其他未完成任务">
+          <span>其他未完成任务</span>
+          {unfinishedTasks.filter((task) => task.id !== resumableTask?.id).map((task) => <button key={task.id} disabled={busy} onClick={() => onResume(task.id)}>
+            <span><strong>{STUDY_MODE_LABELS[task.mode]}</strong><small>{task.status === "in-progress" ? "进行中" : "已暂停"} · {getStudyTaskProgress(task)}</small></span><ChevronRight size={15} />
+          </button>)}
+        </div>}
       </section>}
 
       <div className="lm-home-lower">
@@ -513,12 +534,79 @@ function HomeScreen({ libraries, activeLibrary, selectedLibraryId, settings, his
   );
 }
 
+type LibraryStatusFilter = WordProgressState | "all";
+type LibrarySort = "original" | "newest" | "english" | "status";
+type ImportPreviewFilter = "all" | "abnormal" | "incomplete" | "duplicate" | "suspicious";
+type LibraryViewState = { query: string; status: LibraryStatusFilter; sort: LibrarySort; page: number };
+
+const LIBRARY_PAGE_SIZE = 40;
+const LIBRARY_VIEW_DEFAULT: LibraryViewState = { query: "", status: "all", sort: "original", page: 1 };
+const LIBRARY_VIEW_STORAGE_PREFIX = "lingmatch-library-view-v5:";
+const LIBRARY_STATUS_ORDER: WordProgressState[] = ["new", "learning", "weak", "familiar", "mastered"];
+
+function readLibraryView(libraryId: string): LibraryViewState {
+  if (!libraryId) return LIBRARY_VIEW_DEFAULT;
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(`${LIBRARY_VIEW_STORAGE_PREFIX}${libraryId}`) ?? "null") as Partial<LibraryViewState> | null;
+    return {
+      query: typeof parsed?.query === "string" ? parsed.query : "",
+      status: parsed?.status === "all" || (parsed?.status && LIBRARY_STATUS_ORDER.includes(parsed.status)) ? parsed.status : "all",
+      sort: parsed?.sort === "newest" || parsed?.sort === "english" || parsed?.sort === "status" ? parsed.sort : "original",
+      page: typeof parsed?.page === "number" && Number.isInteger(parsed.page) && parsed.page > 0 ? parsed.page : 1,
+    };
+  } catch {
+    return LIBRARY_VIEW_DEFAULT;
+  }
+}
+
+function persistLibraryView(libraryId: string, view: LibraryViewState) {
+  if (!libraryId) return;
+  try { window.sessionStorage.setItem(`${LIBRARY_VIEW_STORAGE_PREFIX}${libraryId}`, JSON.stringify(view)); } catch { /* Storage may be disabled in a restricted WebView. */ }
+}
+
+interface PagerProps {
+  page: number;
+  pageSize: number;
+  total: number;
+  onPageChange(page: number): void;
+  scrollTargetId: string;
+  label: string;
+}
+
+function Pager({ page, pageSize, total, onPageChange, scrollTargetId, label }: PagerProps) {
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const [pageDraft, setPageDraft] = useState(String(currentPage));
+  useEffect(() => setPageDraft(String(currentPage)), [currentPage]);
+  const jump = () => {
+    const requested = Number(pageDraft);
+    const next = Number.isInteger(requested) ? Math.max(1, Math.min(pageCount, requested)) : currentPage;
+    setPageDraft(String(next));
+    onPageChange(next);
+  };
+  const backToTop = () => {
+    onPageChange(1);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  return <nav className="lm-list-pagination" aria-label={label}>
+    <span className="lm-pagination-count">{total} 条 · 第 {currentPage} / {pageCount} 页</span>
+    <div className="lm-pagination-controls">
+      <button type="button" disabled={currentPage <= 1} onClick={() => onPageChange(1)}>首页</button>
+      <button type="button" disabled={currentPage <= 1} onClick={() => onPageChange(currentPage - 1)}>上一页</button>
+      <label>跳至 <input aria-label="跳到指定页" type="number" min={1} max={pageCount} value={pageDraft} onChange={(event) => setPageDraft(event.target.value)} onBlur={jump} onKeyDown={(event) => { if (event.key === "Enter") jump(); }} /> / {pageCount}</label>
+      <button type="button" disabled={currentPage >= pageCount} onClick={() => onPageChange(currentPage + 1)}>下一页</button>
+      <button type="button" disabled={currentPage >= pageCount} onClick={() => onPageChange(pageCount)}>末页</button>
+      <button type="button" onClick={backToTop}>回到顶部</button>
+      <button type="button" className="lm-pagination-locate" onClick={() => document.getElementById(scrollTargetId)?.scrollIntoView({ behavior: "smooth", block: "start" })}>定位结果</button>
+    </div>
+  </nav>;
+}
+
 interface LibraryScreenProps {
   libraries: WordLibrary[];
   selectedLibraryId: string;
   listWords: (libraryId: string) => Promise<WordEntry[]>;
-  getLearningProfiles: (libraryId: string) => Promise<WordLearningProfile[]>;
-  onSetWordLearningStatus: (wordId: string, status: WordLearningStatus) => Promise<WordLearningProfile>;
+  getLearningProgress: (libraryId: string) => Promise<WordProgress[]>;
   onSelect: (id: string) => void;
   onBack: () => void;
   onImport: () => void;
@@ -526,49 +614,143 @@ interface LibraryScreenProps {
   onCreateLibrary: (name: string, words: WordPairDraft[]) => Promise<void>;
   onRename: (id: string, name: string) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
+  exportBackup: () => Promise<LingMatchBackup>;
+  restoreBackup: (backup: unknown, strategy: RestoreStrategy) => Promise<RestoreSummary>;
 }
 
-function LibraryScreen({ libraries, selectedLibraryId, listWords, getLearningProfiles, onSetWordLearningStatus, onSelect, onBack, onImport, onReimport, onCreateLibrary, onRename, onDelete }: LibraryScreenProps) {
+function LibraryScreen({ libraries, selectedLibraryId, listWords, getLearningProgress, onSelect, onBack, onImport, onReimport, onCreateLibrary, onRename, onDelete, exportBackup, restoreBackup }: LibraryScreenProps) {
   const [entries, setEntries] = useState<WordEntry[]>([]);
-  const [learningProfiles, setLearningProfiles] = useState<WordLearningProfile[]>([]);
-  const [query, setQuery] = useState("");
+  const [wordProgress, setWordProgress] = useState<WordProgress[]>([]);
+  const [viewsByLibrary, setViewsByLibrary] = useState<Record<string, LibraryViewState>>({});
+  const view = viewsByLibrary[selectedLibraryId] ?? readLibraryView(selectedLibraryId);
+  const query = view.query;
+  const statusFilter = view.status;
+  const sort = view.sort;
+  const queryRef = useRef<HTMLInputElement>(null);
+  const backupInputRef = useRef<HTMLInputElement>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupMessage, setBackupMessage] = useState("");
+  const [restoreStrategy, setRestoreStrategy] = useState<RestoreStrategy>("merge");
+  const [pendingRestoreBackup, setPendingRestoreBackup] = useState<LingMatchBackup | null>(null);
   const [loading, setLoading] = useState(false);
-  const [modal, setModal] = useState<"create" | "rename" | "delete" | null>(null);
+  const [modal, setModal] = useState<"create" | "rename" | "delete" | "restore" | null>(null);
   const [name, setName] = useState("");
   const [error, setError] = useState("");
   const selected = libraries.find((library) => library.id === selectedLibraryId);
 
+  const updateView = (patch: Partial<LibraryViewState>) => {
+    const next = { ...view, ...patch };
+    setViewsByLibrary((current) => ({ ...current, [selectedLibraryId]: next }));
+    persistLibraryView(selectedLibraryId, next);
+  };
+
   useEffect(() => {
     let cancelled = false;
-    if (!selectedLibraryId) { setEntries([]); setLearningProfiles([]); return; }
+    if (!selectedLibraryId) { setEntries([]); setWordProgress([]); return; }
     setLoading(true);
-    Promise.all([listWords(selectedLibraryId), getLearningProfiles(selectedLibraryId)])
-      .then(([words, profiles]) => { if (!cancelled) { setEntries(words); setLearningProfiles(profiles); } })
+    Promise.all([listWords(selectedLibraryId), getLearningProgress(selectedLibraryId)])
+      .then(([words, progress]) => { if (!cancelled) { setEntries(words); setWordProgress(progress); } })
       .catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause.message : "读取词条失败。"); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [selectedLibraryId, listWords, getLearningProfiles, libraries]);
+  }, [selectedLibraryId, listWords, getLearningProgress, libraries]);
 
-  const profileByWordId = useMemo(() => new Map(learningProfiles.map((profile) => [profile.wordId, profile])), [learningProfiles]);
-
-  const handleStatusChange = async (wordId: string, status: WordLearningStatus) => {
-    try {
-      const updated = await onSetWordLearningStatus(wordId, status);
-      setLearningProfiles((current) => [...current.filter((profile) => profile.wordId !== wordId), updated]);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "保存单词状态失败。");
-    }
-  };
+  const progressByWordId = useMemo(() => new Map(wordProgress.map((progress) => [progress.wordId, progress])), [wordProgress]);
 
   const visibleEntries = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    if (!normalized) return entries;
-    return entries.filter((word) => word.english.toLocaleLowerCase().includes(normalized) || word.chinese.includes(query.trim()));
-  }, [entries, query]);
+    const filtered = entries.filter((word) => {
+      const matchesQuery = !normalized
+        || word.english.toLocaleLowerCase().includes(normalized)
+        || word.chinese.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+      const matchesStatus = statusFilter === "all" || (progressByWordId.get(word.id)?.state ?? "new") === statusFilter;
+      return matchesQuery && matchesStatus;
+    });
+    const statusIndex = (word: WordEntry) => LIBRARY_STATUS_ORDER.indexOf(progressByWordId.get(word.id)?.state ?? "new");
+    if (sort === "newest") return filtered.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
+    if (sort === "english") return filtered.sort((left, right) => left.english.localeCompare(right.english, undefined, { sensitivity: "base" }) || left.id.localeCompare(right.id));
+    if (sort === "status") return filtered.sort((left, right) => statusIndex(left) - statusIndex(right) || left.english.localeCompare(right.english));
+    return filtered;
+  }, [entries, progressByWordId, query, sort, statusFilter]);
+  const pageCount = Math.max(1, Math.ceil(visibleEntries.length / LIBRARY_PAGE_SIZE));
+  const currentPage = Math.min(view.page, pageCount);
+  const pageEntries = visibleEntries.slice((currentPage - 1) * LIBRARY_PAGE_SIZE, currentPage * LIBRARY_PAGE_SIZE);
+
+  useEffect(() => {
+    if (view.page > pageCount) updateView({ page: pageCount });
+  }, [view.page, pageCount]);
+
+  const onSearchChange = (value: string) => updateView({ query: value, page: 1 });
+  const onStatusFilterChange = (value: LibraryStatusFilter) => updateView({ status: value, page: 1 });
+  const onSortChange = (value: LibrarySort) => updateView({ sort: value, page: 1 });
+
+  const downloadBackup = async () => {
+    setBackupBusy(true); setBackupMessage(""); setError("");
+    try {
+      const backup = await exportBackup();
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `LingMatch-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+      setBackupMessage("完整备份已导出到此设备。请妥善保存 JSON 文件。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "导出备份失败。");
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const applyRestore = async (backup: LingMatchBackup, strategy: RestoreStrategy) => {
+    const summary = await restoreBackup(backup, strategy);
+    const added = Object.values(summary).reduce((sum, store) => sum + store.added, 0);
+    const kept = Object.values(summary).reduce((sum, store) => sum + store.kept, 0);
+    const removed = Object.values(summary).reduce((sum, store) => sum + store.removed, 0);
+    const [words, progress] = await Promise.all([listWords(selectedLibraryId), getLearningProgress(selectedLibraryId)]);
+    setEntries(words); setWordProgress(progress);
+    setBackupMessage(strategy === "replace"
+      ? `完整替换完成：恢复 ${added} 条备份记录，替换前移除了 ${removed} 条本机记录。`
+      : `合并完成：补入 ${added} 条记录，保留本机冲突项 ${kept} 条。`);
+  };
+
+  const restoreFromFile = async (file?: File) => {
+    if (!file) return;
+    setBackupBusy(true); setBackupMessage(""); setError("");
+    try {
+      const backup = parseLingMatchBackup(JSON.parse(await file.text()));
+      if (restoreStrategy === "replace") {
+        setPendingRestoreBackup(backup);
+        setBackupMessage(`备份已验证：${backup.data.libraries.length} 个词库、${backup.data.words.length} 个词条。确认后将替换这台设备上的全部 LingMatch 数据。`);
+        setModal("restore");
+      } else {
+        await applyRestore(backup, "merge");
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法恢复这个备份；现有数据未更改。");
+    } finally {
+      setBackupBusy(false);
+      if (backupInputRef.current) backupInputRef.current.value = "";
+    }
+  };
+
+  const confirmReplaceRestore = async () => {
+    if (!pendingRestoreBackup || backupBusy) return;
+    setBackupBusy(true); setError(""); setBackupMessage("");
+    try {
+      await applyRestore(pendingRestoreBackup, "replace");
+      setPendingRestoreBackup(null); setModal(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "替换失败；原有数据已保留。");
+    } finally {
+      setBackupBusy(false);
+    }
+  };
 
   const openRename = () => { setName(selected?.name ?? ""); setError(""); setModal("rename"); };
   const openCreate = () => { setName(""); setError(""); setModal("create"); };
-  const closeModal = () => { setModal(null); setError(""); };
+  const closeModal = () => { setModal(null); setError(""); if (modal === "restore") setPendingRestoreBackup(null); };
 
   const submitName = async () => {
     const trimmed = name.trim();
@@ -599,7 +781,7 @@ function LibraryScreen({ libraries, selectedLibraryId, listWords, getLearningPro
         <aside className="lm-library-list" aria-label="词库列表">
           <div className="lm-library-list-title"><span>词库</span><span>{libraries.length}</span></div>
           {libraries.length === 0 ? <div className="lm-library-empty-small">还没有词库。<button onClick={onImport}>导入第一份词表</button></div> : libraries.map((library) => (
-            <button className={`lm-library-row ${library.id === selectedLibraryId ? "is-selected" : ""}`} key={library.id} onClick={() => { onSelect(library.id); setQuery(""); }}>
+            <button className={`lm-library-row ${library.id === selectedLibraryId ? "is-selected" : ""}`} key={library.id} onClick={() => onSelect(library.id)}>
               <span className="lm-library-row-icon"><BookOpen size={17} /></span><span className="lm-library-row-copy"><strong>{library.name}</strong><small>{library.wordCount} 个词条</small></span><ChevronRight size={16} />
             </button>
           ))}
@@ -613,14 +795,33 @@ function LibraryScreen({ libraries, selectedLibraryId, listWords, getLearningPro
                 <div><span className="lm-eyebrow">当前词库</span><h2>{selected.name}</h2><p>{selected.wordCount} 个词条 · 随时可以开始配对</p></div>
                 <div className="lm-detail-actions"><button className="lm-icon-button" aria-label="重命名词库" onClick={openRename}><Pencil size={17} /></button><button className="lm-icon-button lm-danger-icon" aria-label="删除词库" onClick={() => { setError(""); setModal("delete"); }}><Trash2 size={17} /></button></div>
               </div>
-              <div className="lm-words-toolbar"><div className="lm-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索英文或中文" aria-label="搜索词条" /></div><button className="lm-button lm-button-secondary lm-compact-button" onClick={() => onReimport(selected.id)}><Upload size={16} /> 替换词表</button><button className="lm-button lm-button-secondary lm-compact-button" onClick={onImport}><Plus size={16} /> 新建词库</button></div>
+              <div className="lm-backup-toolbar">
+                <span><strong>数据备份</strong><small>包含词库、进度、练习历史与设置</small></span>
+                <div><button className="lm-button lm-button-secondary lm-compact-button" disabled={backupBusy} onClick={() => void downloadBackup()}><Download size={15} /> 导出 JSON</button><button className="lm-button lm-button-secondary lm-compact-button" disabled={backupBusy} onClick={() => backupInputRef.current?.click()}><Upload size={15} /> 恢复备份</button></div>
+                <input ref={backupInputRef} className="sr-only" type="file" accept="application/json,.json" aria-label="选择 LingMatch JSON 备份" onChange={(event) => void restoreFromFile(event.target.files?.[0])} />
+              </div>
+              <fieldset className="lm-restore-strategies" disabled={backupBusy}>
+                <legend>选择恢复方式</legend>
+                <label><input type="radio" name="restore-strategy" value="merge" checked={restoreStrategy === "merge"} onChange={() => setRestoreStrategy("merge")} /><span><strong>合并备份</strong><small>补回缺少的记录；相同 ID 的本机内容保留。</small></span></label>
+                <label><input type="radio" name="restore-strategy" value="replace" checked={restoreStrategy === "replace"} onChange={() => setRestoreStrategy("replace")} /><span><strong>完整替换</strong><small>先校验并二次确认；替换全部词库、词条、进度、历史和设置。</small></span></label>
+              </fieldset>
+              {backupMessage && <p className="lm-backup-message" role="status">{backupMessage}</p>}
+              <div className="lm-words-toolbar">
+                <div className="lm-search"><Search size={17} /><input ref={queryRef} value={query} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索英文或中文" aria-label="搜索英文或中文词条" /></div>
+                <select aria-label="按学习状态筛选" value={statusFilter} onChange={(event) => onStatusFilterChange(event.target.value as LibraryStatusFilter)}><option value="all">全部状态</option>{(Object.entries(LEARNING_STATUS_LABELS) as [WordProgressState, string][]).map(([status, label]) => <option key={status} value={status}>{label}</option>)}</select>
+                <select aria-label="词条排序方式" value={sort} onChange={(event) => onSortChange(event.target.value as LibrarySort)}><option value="original">原始顺序</option><option value="newest">最新添加</option><option value="english">英文 A–Z</option><option value="status">学习状态</option></select>
+                <button className="lm-button lm-button-secondary lm-compact-button" onClick={() => onReimport(selected.id)}><Upload size={16} /> 替换词表</button><button className="lm-button lm-button-secondary lm-compact-button" onClick={onImport}><Plus size={16} /> 新建词库</button>
+              </div>
               {loading ? <div className="lm-loading-state">正在读取词条…</div> : entries.length === 0 ? (
                 <div className="lm-empty-words"><span><BookOpen size={22} /></span><h3>词库还空着</h3><p>导入一份中英词表，开始你的第一轮配对。</p><button className="lm-button lm-button-primary" onClick={onImport}><Upload size={17} /> 导入词表</button></div>
               ) : visibleEntries.length === 0 ? <div className="lm-loading-state">没有找到匹配的词条。</div> : (
-                <div className="lm-word-list-wrap">
-                  <div className="lm-word-list-labels"><span>ENGLISH</span><span>中文释义</span><span>学习状态</span></div>
-                  <div className="lm-word-list">{visibleEntries.map((word) => <div className="lm-word-row" key={word.id}><span>{word.english}</span><span>{word.chinese}</span><select aria-label={`调整 ${word.english} 的学习状态`} value={profileByWordId.get(word.id)?.status ?? "unlearned"} onChange={(event) => void handleStatusChange(word.id, event.target.value as WordLearningStatus)}>{(Object.entries(LEARNING_STATUS_LABELS) as [WordLearningStatus, string][]).map(([status, label]) => <option key={status} value={status}>{label}</option>)}</select></div>)}</div>
-                  <div className="lm-word-count-note">显示 {visibleEntries.length} / {entries.length} 个词条</div>
+                <div className="lm-word-list-wrap" id="lm-word-list">
+                  <div className="lm-word-list-labels"><span>ENGLISH</span><span>中文释义</span><span>自动学习状态</span></div>
+                  <div className="lm-word-list">{pageEntries.map((word) => {
+                    const state = progressByWordId.get(word.id)?.state ?? "new";
+                    return <div className="lm-word-row" key={word.id}><span className="lm-word-english">{word.english}</span><details className="lm-word-definition"><summary title={word.chinese}>{word.chinese}</summary><div>{word.chinese}</div></details><span className={`lm-word-state is-${state}`}>{LEARNING_STATUS_LABELS[state]}</span></div>;
+                  })}</div>
+                  <Pager page={currentPage} pageSize={LIBRARY_PAGE_SIZE} total={visibleEntries.length} onPageChange={(page) => updateView({ page })} scrollTargetId="lm-word-list" label="词库分页" />
                 </div>
               )}
             </>
@@ -632,8 +833,9 @@ function LibraryScreen({ libraries, selectedLibraryId, listWords, getLearningPro
       {error && !modal && <div className="lm-inline-alert" role="alert">{error}</div>}
 
       <AnimatePresence>
-        {modal && <Dialog onClose={closeModal} title={modal === "create" ? "新建词库" : modal === "rename" ? "重命名词库" : "删除词库？"}>
-          {modal === "delete" ? <><p className="lm-dialog-copy">删除「{selected?.name}」及其中的所有词条和练习记录。此操作无法撤销。</p><div className="lm-dialog-actions"><button className="lm-button lm-button-secondary" onClick={closeModal}>保留词库</button><button className="lm-button lm-button-danger" onClick={confirmDelete}><Trash2 size={16} /> 删除词库</button></div></> : <><label className="lm-field-label" htmlFor="library-name">词库名称</label><input id="library-name" className="lm-text-input" autoFocus maxLength={60} value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void submitName(); }} placeholder="例如：旅行英语" />{error && <p className="lm-form-error">{error}</p>}<div className="lm-dialog-actions"><button className="lm-button lm-button-secondary" onClick={closeModal}>取消</button><button className="lm-button lm-button-primary" onClick={() => void submitName()}>{modal === "create" ? "创建词库" : "保存名称"}</button></div></>}
+        {modal && <Dialog onClose={closeModal} title={modal === "create" ? "新建词库" : modal === "rename" ? "重命名词库" : modal === "restore" ? "确认完整替换？" : "删除词库？"}>
+          {modal === "restore" ? <><p className="lm-dialog-copy">已通过完整格式和引用检查。继续后将以备份中的全部数据替换此设备当前所有 LingMatch 词库、词条、学习档案、练习历史、未完成任务和设置。该操作无法撤销。</p>{error && <p className="lm-form-error" role="alert">{error}</p>}<div className="lm-dialog-actions"><button className="lm-button lm-button-secondary" disabled={backupBusy} onClick={closeModal}>取消</button><button className="lm-button lm-button-danger" disabled={backupBusy} onClick={() => void confirmReplaceRestore()}>{backupBusy ? "正在替换…" : "确认替换全部数据"}</button></div></>
+            : modal === "delete" ? <><p className="lm-dialog-copy">删除「{selected?.name}」及其中的所有词条和练习记录。此操作无法撤销。</p><div className="lm-dialog-actions"><button className="lm-button lm-button-secondary" onClick={closeModal}>保留词库</button><button className="lm-button lm-button-danger" onClick={confirmDelete}><Trash2 size={16} /> 删除词库</button></div></> : <><label className="lm-field-label" htmlFor="library-name">词库名称</label><input id="library-name" className="lm-text-input" autoFocus maxLength={60} value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void submitName(); }} placeholder="例如：旅行英语" />{error && <p className="lm-form-error">{error}</p>}<div className="lm-dialog-actions"><button className="lm-button lm-button-secondary" onClick={closeModal}>取消</button><button className="lm-button lm-button-primary" onClick={() => void submitName()}>{modal === "create" ? "创建词库" : "保存名称"}</button></div></>}
         </Dialog>}
       </AnimatePresence>
     </section>
@@ -668,6 +870,18 @@ function ImportScreen({ parseFile, onCreateLibrary, replaceLibraryId, replaceLib
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [parseOptions, setParseOptions] = useState<ImportOptions>({ delimiter: "auto" });
+  const [previewQuery, setPreviewQuery] = useState(() => {
+    try { return window.sessionStorage.getItem("lingmatch-import-preview-query-v5") ?? ""; } catch { return ""; }
+  });
+  const [previewFilter, setPreviewFilter] = useState<ImportPreviewFilter>(() => {
+    try {
+      const saved = window.sessionStorage.getItem("lingmatch-import-preview-filter-v5");
+      return saved === "abnormal" || saved === "incomplete" || saved === "duplicate" || saved === "suspicious" ? saved : "all";
+    } catch { return "all"; }
+  });
+  const [previewPage, setPreviewPage] = useState(() => {
+    try { const saved = Number(window.sessionStorage.getItem("lingmatch-import-preview-page-v5")); return Number.isInteger(saved) && saved > 0 ? saved : 1; } catch { return 1; }
+  });
   const replacing = Boolean(replaceLibraryId);
 
   useEffect(() => {
@@ -740,7 +954,39 @@ function ImportScreen({ parseFile, onCreateLibrary, replaceLibraryId, replaceLib
     const chineseLooksEnglish = /[A-Za-z]/.test(row.chinese) && !/[\u3400-\u9fff]/u.test(row.chinese);
     return englishLooksChinese || chineseLooksEnglish ? [index] : [];
   })), [rows]);
+  const filteredPreviewRows = useMemo(() => {
+    const normalized = previewQuery.trim().toLocaleLowerCase();
+    return rows.flatMap((row, index) => {
+      const empty = !row.english.trim() || !row.chinese.trim();
+      const duplicate = duplicateIndexes.has(index);
+      const suspicious = suspiciousIndexes.has(index);
+      const matchesQuery = !normalized || row.english.toLocaleLowerCase().includes(normalized) || row.chinese.toLocaleLowerCase().includes(normalized);
+      const matchesFilter = previewFilter === "all"
+        || (previewFilter === "abnormal" && (empty || duplicate || suspicious))
+        || (previewFilter === "incomplete" && empty)
+        || (previewFilter === "duplicate" && duplicate)
+        || (previewFilter === "suspicious" && suspicious);
+      return matchesQuery && matchesFilter ? [{ row, index }] : [];
+    });
+  }, [rows, previewQuery, previewFilter, duplicateIndexes, suspiciousIndexes]);
+  const previewPageCount = Math.max(1, Math.ceil(filteredPreviewRows.length / LIBRARY_PAGE_SIZE));
+  const currentPreviewPage = Math.min(previewPage, previewPageCount);
+  const pagedPreviewRows = filteredPreviewRows.slice((currentPreviewPage - 1) * LIBRARY_PAGE_SIZE, currentPreviewPage * LIBRARY_PAGE_SIZE);
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem("lingmatch-import-preview-query-v5", previewQuery);
+      window.sessionStorage.setItem("lingmatch-import-preview-filter-v5", previewFilter);
+      window.sessionStorage.setItem("lingmatch-import-preview-page-v5", String(currentPreviewPage));
+    } catch { /* Keep the preview usable when WebView storage is unavailable. */ }
+  }, [previewQuery, previewFilter, currentPreviewPage]);
+  useEffect(() => {
+    if (previewPage > previewPageCount) setPreviewPage(previewPageCount);
+  }, [previewPage, previewPageCount]);
   const readyRows = rows.filter((row, index) => row.english.trim() && row.chinese.trim() && (!excludeDuplicates || !duplicateIndexes.has(index)));
+
+  const changePreviewQuery = (value: string) => { setPreviewQuery(value); setPreviewPage(1); };
+  const changePreviewFilter = (value: ImportPreviewFilter) => { setPreviewFilter(value); setPreviewPage(1); };
 
   const updateRow = (index: number, side: keyof WordPairDraft, value: string) => {
     setRows((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, [side]: value } : row));
@@ -803,9 +1049,16 @@ function ImportScreen({ parseFile, onCreateLibrary, replaceLibraryId, replaceLib
           <div className="lm-import-review">
           <div className="lm-import-review-head"><div><span className="lm-eyebrow">确认后再保存</span><h2>检查词条</h2><p className="lm-import-audit">来源 {parsed.sourceRows?.length ?? parsed.words.length} 行 · 预览保留 {rows.length} 条 · 疑似错配 {suspiciousIndexes.size} 条</p></div><span className="lm-review-count"><strong>{readyRows.length}</strong> 条可导入{duplicateIndexes.size > 0 && <em> · {duplicateIndexes.size} 条重复</em>}{emptyCount > 0 && <em> · {emptyCount} 条待补全</em>}{suspiciousIndexes.size > 0 && <em> · {suspiciousIndexes.size} 条疑似错配</em>}</span></div>
             {replacing ? <div className="lm-replace-notice"><RefreshCw size={16} /><span><strong>替换词库内容</strong><small>现有 {replaceLibrary?.wordCount ?? 0} 个词条会被替换，词库名称和练习记录保留。</small></span></div> : <><label className="lm-field-label" htmlFor="import-library-name">新词库名称</label><input id="import-library-name" className="lm-text-input lm-import-name" value={libraryName} onChange={(event) => setLibraryName(event.target.value)} maxLength={60} /></>}
-            <div className="lm-preview-table-wrap">
+            <div className="lm-import-preview-tools" aria-label="筛选导入预览">
+              <label className="lm-search"><Search size={17} /><input value={previewQuery} onChange={(event) => changePreviewQuery(event.target.value)} placeholder="搜索英文或中文释义" aria-label="搜索预览中的英文或中文" /></label>
+              <label className="lm-preview-filter-label">显示<select aria-label="筛选导入异常" value={previewFilter} onChange={(event) => changePreviewFilter(event.target.value as ImportPreviewFilter)}>
+                <option value="all">全部词条</option><option value="abnormal">所有异常</option><option value="incomplete">缺少内容</option><option value="duplicate">重复词条</option><option value="suspicious">疑似错配</option>
+              </select></label>
+              <span className="lm-preview-filter-count">显示 {filteredPreviewRows.length} / {rows.length} 条</span>
+            </div>
+            <div className="lm-preview-table-wrap" id="lm-preview-table-wrap">
               <div className="lm-preview-header"><span>英文</span><span>中文释义</span><span className="sr-only">操作</span></div>
-              <div className="lm-preview-body">{rows.map((row, index) => {
+              <div className="lm-preview-body">{pagedPreviewRows.map(({ row, index }) => {
                 const empty = !row.english.trim() || !row.chinese.trim();
                 const duplicate = duplicateIndexes.has(index);
                 const suspicious = suspiciousIndexes.has(index);
@@ -814,9 +1067,10 @@ function ImportScreen({ parseFile, onCreateLibrary, replaceLibraryId, replaceLib
                   <input aria-label={`第 ${index + 1} 行中文`} value={row.chinese} onChange={(event) => updateRow(index, "chinese", event.target.value)} placeholder="中文释义" />
                   <span className="lm-row-status">{duplicate ? <span className="lm-duplicate-tag">重复</span> : empty ? <span className="lm-incomplete-tag">待补</span> : suspicious ? <span className="lm-incomplete-tag">核对</span> : null}<button className="lm-icon-button" aria-label={`明确删除第 ${index + 1} 行`} onClick={() => removeRow(index)}><X size={15} /></button></span>
                 </div>;
-              })}</div>
+              })}{pagedPreviewRows.length === 0 && <div className="lm-loading-state">没有符合条件的词条。</div>}</div>
               <button className="lm-add-row" onClick={addRow}><Plus size={16} /> 添加一行</button>
             </div>
+            {filteredPreviewRows.length > 0 && <Pager page={currentPreviewPage} pageSize={LIBRARY_PAGE_SIZE} total={filteredPreviewRows.length} onPageChange={setPreviewPage} scrollTargetId="lm-preview-table-wrap" label="导入预览分页" />}
             {duplicateIndexes.size > 0 && <label className="lm-checkbox-label lm-duplicate-toggle"><input type="checkbox" checked={excludeDuplicates} onChange={(event) => setExcludeDuplicates(event.target.checked)} /> 明确排除重复词条（默认保留）</label>}
             {emptyCount > 0 && <p className="lm-import-blocking-note">还有 {emptyCount} 条词目缺少内容。请补齐，或逐条点 × 明确删除后再导入。</p>}
             {error && <div className="lm-form-error lm-import-error" role="alert">{error}</div>}
@@ -836,7 +1090,7 @@ interface MatchGameProps {
   settings: GameSettings;
   onExit: () => void;
   onRecordPairResolution(input: { taskId: string; roundNumber: number; englishWordId: string; chineseWordId: string; correct: boolean }): Promise<StudyTask>;
-  onFinish: (ratings: Record<string, ReviewRating>, durationSeconds: number) => Promise<CompletedRoundResult>;
+  onFinish: (durationSeconds: number) => Promise<CompletedRoundResult>;
   onReplay: () => void;
 }
 
@@ -848,14 +1102,14 @@ function MatchGame({ library, entries, task, settings, onExit, onRecordPairResol
   const [matched, setMatched] = useState<Set<string>>(() => new Set(task.currentMatchedWordIds));
   const [errorIds, setErrorIds] = useState<Set<string>>(() => new Set());
   const [locked, setLocked] = useState(false);
-  const [wordMisses, setWordMisses] = useState<Record<string, number>>(() => ({ ...task.currentMissesByWord }));
-  const [ratings, setRatings] = useState<Record<string, ReviewRating>>({});
+  const [wordMisses, setWordMisses] = useState<Record<string, number>>(() => ({ ...task.mistakesByWord }));
   const [elapsed, setElapsed] = useState(0);
   const [exitConfirm, setExitConfirm] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [savingRound, setSavingRound] = useState(false);
   const [completedTask, setCompletedTask] = useState<CompletedRoundResult | undefined>();
   const startAt = useRef(Date.now());
+  const autoSaveStarted = useRef(false);
   const audioRef = useRef<AudioContext | null>(null);
   const animationTimer = useRef<number | null>(null);
   const remainingEnglish = useMemo(() => round.english.filter((card) => !matched.has(card.wordId)), [matched, round.english]);
@@ -863,7 +1117,6 @@ function MatchGame({ library, entries, task, settings, onExit, onRecordPairResol
   const totalMisses = Object.values(wordMisses).reduce((sum, value) => sum + value, 0);
   const mistakes = Math.ceil(totalMisses / 2);
   const allMatched = round.words.length > 0 && matched.size === round.words.length;
-  const allRated = round.words.length > 0 && round.words.every((word) => Boolean(ratings[word.id]));
 
   useEffect(() => {
     const interval = window.setInterval(() => setElapsed(Math.floor((Date.now() - startAt.current) / 1000)), 1000);
@@ -935,18 +1188,24 @@ function MatchGame({ library, entries, task, settings, onExit, onRecordPairResol
   };
 
   const finishRound = async () => {
-    if (!allMatched || !allRated || savingRound) return;
+    if (!allMatched || autoSaveStarted.current || savingRound) return;
+    autoSaveStarted.current = true;
     setSavingRound(true);
     setSaveError("");
     try {
-      const result = await onFinish(ratings, Math.floor((Date.now() - startAt.current) / 1000));
+      const result = await onFinish(Math.floor((Date.now() - startAt.current) / 1000));
       if (result.task.status === "completed") setCompletedTask(result);
     } catch (cause) {
+      autoSaveStarted.current = false;
       setSaveError(cause instanceof Error ? cause.message : "本轮完成了，但保存记录失败。请再试一次。");
     } finally {
       setSavingRound(false);
     }
   };
+
+  useEffect(() => {
+    if (allMatched && !autoSaveStarted.current) void finishRound();
+  }, [allMatched]);
 
   useEffect(() => () => {
     if (animationTimer.current !== null) window.clearTimeout(animationTimer.current);
@@ -965,7 +1224,7 @@ function MatchGame({ library, entries, task, settings, onExit, onRecordPairResol
       <div className="lm-game-content"><section className="lm-game-complete" aria-live="polite">
         <div className="lm-win-confetti" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /><i /></div>
         <motion.div className="lm-win-icon" initial={{ scale: 0.6, rotate: -12 }} animate={{ scale: 1, rotate: 0 }} transition={{ type: "spring", stiffness: 210, damping: 16 }}><Trophy size={34} /></motion.div>
-        <span className="lm-eyebrow">学习任务完成</span><h1>今天的学习完成了。</h1><p>每个词条的记忆反馈和下次复习时间都已保存。</p>
+        <span className="lm-eyebrow">学习任务完成</span><h1>今天的学习完成了。</h1><p>系统已根据本次配对表现自动更新学习进度和复习时间。</p>
         <div className="lm-win-stats"><div><strong>{finished.completedWordIds.length}</strong><span>计划词条</span></div><div><strong>{finished.roundNumber}</strong><span>练习轮次</span></div><div><strong>{formatDuration(finished.durationSeconds)}</strong><span>学习时长</span></div></div>
         <div className="lm-win-performance"><Sparkles size={17} />累计配对准确率 {taskAccuracy}% · {finished.totalMistakes} 次错配</div>
         {saveError && <p className="lm-form-error" role="alert">{saveError}</p>}
@@ -984,16 +1243,12 @@ function MatchGame({ library, entries, task, settings, onExit, onRecordPairResol
       <div className="lm-game-progress"><div style={{ width: `${progress * 100}%` }} /></div>
       <div className="lm-game-content">
         {allMatched ? (
-          <section className="lm-round-feedback" aria-live="polite">
-            <div className="lm-feedback-heading"><span className="lm-eyebrow">这一轮配对完成</span><h1>你真的记住了吗？</h1><p>配对正确不一定代表掌握。请按实际记忆为每个词选择一次反馈。</p></div>
-            <div className="lm-feedback-list">{round.words.map((word) => <article className="lm-feedback-word" key={word.id}>
-              <div className="lm-feedback-definition"><strong>{word.english}</strong><span>{word.chinese}</span>{(wordMisses[word.id] ?? 0) > 0 && <small>本轮错配 {wordMisses[word.id]} 次</small>}</div>
-              <div className="lm-rating-options" role="group" aria-label={`对 ${word.english} 的记忆反馈`}>
-                {([['forgotten', '忘记了'], ['uncertain', '不太确定'], ['remembered', '记住了']] as const).map(([rating, label]) => <button key={rating} className={ratings[word.id] === rating ? "is-selected" : ""} aria-pressed={ratings[word.id] === rating} onClick={() => setRatings((current) => ({ ...current, [word.id]: rating }))}>{label}</button>)}
-              </div>
-            </article>)}</div>
-            <div className="lm-feedback-submit"><span>{Object.keys(ratings).length} / {round.words.length} 个词已反馈</span><button className="lm-button lm-button-primary" disabled={!allRated || savingRound} onClick={() => void finishRound()}>{savingRound ? "正在保存…" : "保存并继续"}<ChevronRight size={17} /></button></div>
-            {saveError && <p className="lm-form-error" role="alert">{saveError}</p>}
+          <section className="lm-round-autosave" aria-live="polite">
+            <span className="lm-autosave-mark"><CheckCircle2 size={25} /></span>
+            <span className="lm-eyebrow">这一轮配对完成</span>
+            <h1>{savingRound ? "正在保存本轮表现…" : saveError ? "本轮记录尚未保存" : "本轮表现已自动记录"}</h1>
+            <p>{round.words.length} 个词条 · 错配 {mistakes} 次。系统会结合错配次数和既往练习安排下次复习，不需要逐词评价。</p>
+            {saveError ? <><p className="lm-form-error" role="alert">{saveError}</p><button className="lm-button lm-button-primary" disabled={savingRound} onClick={() => { autoSaveStarted.current = false; void finishRound(); }}>{savingRound ? "正在保存…" : "重试保存"}<RotateCw size={16} /></button></> : <small>{savingRound ? "请稍候，保存完成后会自动进入下一轮。" : "保存完成后将自动进入下一轮。"}</small>}
           </section>
         ) : (
           <>

@@ -1,6 +1,8 @@
 import { useEffect, useMemo } from 'react'
 import { LingMatchApp } from '../ui/LingMatchApp'
 import { parseImportFile } from '../features/importer/importManager'
+import { exportLingMatchBackup, restoreLingMatchBackup } from '../features/backup/backupService'
+import type { RestoreStrategy } from '../features/backup/backupService'
 import {
   createLibrary as createLibraryService,
   deleteLibrary as deleteLibraryService,
@@ -11,16 +13,30 @@ import {
 import {
   completeStudyRound,
   createStudyTask,
-  getLearningProfiles,
-  getLearningStats,
-  getResumableStudyTask,
+  getLearningProgress,
+  getLearningDashboard,
   pauseStudyTask,
   recordPairResolution,
   resumeStudyTask,
-  setWordLearningStatus,
 } from '../features/learning/learningService'
 import { useAppStore } from '../stores/appStore'
-import type { PairCount, ReviewRating, StudyTaskMode, WordLearningStatus, WordPairDraft } from '../types/domain'
+import type { PairCount, StudyTaskMode, WordPairDraft } from '../types/domain'
+
+function clearLegacyLingMatchSessionPreferences() {
+  if (typeof window === 'undefined') return
+  try {
+    const storage = window.sessionStorage
+    const legacyKeys = Array.from({ length: storage.length }, (_, index) => storage.key(index))
+      .filter((key): key is string => key !== null)
+      .filter((key) => key.startsWith('lingmatch-library-view:')
+        || key === 'lingmatch-import-preview-query'
+        || key === 'lingmatch-import-preview-filter'
+        || key === 'lingmatch-import-preview-page')
+    for (const key of legacyKeys) storage.removeItem(key)
+  } catch {
+    // The WebView can disable sessionStorage; all new preferences still default safely.
+  }
+}
 
 export function AppRoot() {
   const libraries = useAppStore((state) => state.libraries)
@@ -34,7 +50,6 @@ export function AppRoot() {
   const refreshHistory = useAppStore((state) => state.refreshHistory)
   const persistSettings = useAppStore((state) => state.persistSettings)
   const persistTheme = useAppStore((state) => state.persistTheme)
-  const persistResult = useAppStore((state) => state.persistResult)
   const callbacks = useMemo(() => ({
     async createLibrary(name: string, words: WordPairDraft[]) {
       await createLibraryService(name, words)
@@ -58,19 +73,21 @@ export function AppRoot() {
     resumeStudyTask,
     pauseStudyTask,
     recordPairResolution,
-    async completeStudyRound(taskId: string, roundNumber: number, ratings: Record<string, ReviewRating>, durationSeconds: number) {
-      const result = await completeStudyRound({ taskId, roundNumber, ratings, durationSeconds })
+    async completeStudyRound(taskId: string, roundNumber: number, durationSeconds: number) {
+      const result = await completeStudyRound({ taskId, roundNumber, durationSeconds })
       await refreshHistory()
       return result
     },
-    getLearningStats,
-    getLearningProfiles,
-    setWordLearningStatus(wordId: string, status: WordLearningStatus) {
-      return setWordLearningStatus(wordId, status)
+    exportBackup: exportLingMatchBackup,
+    async restoreBackup(backup: unknown, strategy: RestoreStrategy) {
+      const summary = await restoreLingMatchBackup(backup, { strategy })
+      await initialize()
+      return summary
     },
-  }), [refreshHistory, refreshLibraries])
+  }), [initialize, refreshHistory, refreshLibraries])
 
   useEffect(() => {
+    clearLegacyLingMatchSessionPreferences()
     void initialize()
   }, [initialize])
 
@@ -89,18 +106,17 @@ export function AppRoot() {
       renameLibrary={callbacks.renameLibrary}
       deleteLibrary={callbacks.deleteLibrary}
       saveSettings={persistSettings}
-      saveResult={persistResult}
       createStudyTask={callbacks.createStudyTask}
       resumeStudyTask={callbacks.resumeStudyTask}
       pauseStudyTask={callbacks.pauseStudyTask}
       recordPairResolution={callbacks.recordPairResolution}
       completeStudyRound={callbacks.completeStudyRound}
-      getResumableStudyTask={getResumableStudyTask}
-      getLearningStats={callbacks.getLearningStats}
-      getLearningProfiles={callbacks.getLearningProfiles}
-      setWordLearningStatus={callbacks.setWordLearningStatus}
+      getLearningDashboard={getLearningDashboard}
+      getLearningProgress={getLearningProgress}
       theme={theme}
       saveTheme={persistTheme}
+      exportBackup={callbacks.exportBackup}
+      restoreBackup={callbacks.restoreBackup}
     />
   )
 }

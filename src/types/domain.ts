@@ -37,25 +37,20 @@ export interface GameResult {
   mode?: PracticeMode
 }
 
-export type WordLearningStatus = 'unlearned' | 'learning' | 'fuzzy' | 'familiar' | 'mastered'
+export type WordProgressState = 'new' | 'learning' | 'weak' | 'familiar' | 'mastered'
 export type PracticeMode = 'match' | 'flashcard' | 'multipleChoice' | 'spelling' | 'listening'
-export type StudyTaskMode = 'new' | 'wrong' | 'due' | 'mixed' | 'all' | 'weak'
-export type ReviewRating = 'forgotten' | 'uncertain' | 'remembered'
-export type StudyTaskStatus = 'in-progress' | 'completed' | 'paused'
+export type StudyTaskMode = 'due' | 'weak' | 'new' | 'comprehensive'
+export type StudyTaskStatus = 'in-progress' | 'completed' | 'paused' | 'superseded'
 
-export interface WordLearningProfile {
+export interface WordProgress {
   wordId: string
   libraryId: string
-  status: WordLearningStatus
-  statusSource: 'system' | 'manual'
-  correctCount: number
-  incorrectCount: number
+  state: WordProgressState
+  correctSessions: number
+  wrongSessions: number
   consecutiveCorrect: number
-  repetitions: number
-  intervalDays: number
-  easeFactor: number
   lastPracticedAt: number | null
-  lastIncorrectAt: number | null
+  lastWrongAt: number | null
   nextReviewAt: number | null
   updatedAt: number
 }
@@ -66,11 +61,9 @@ export interface PracticeEvent {
   libraryId: string
   taskId: string
   roundId: string
-  roundNumber: number
-  mode: PracticeMode
-  correct: boolean
-  misses: number
-  rating: ReviewRating
+  mode: StudyTaskMode
+  mistakes: number
+  firstTryCorrect: boolean
   practicedAt: number
 }
 
@@ -80,14 +73,11 @@ export interface StudyTask {
   mode: StudyTaskMode
   practiceMode: PracticeMode
   status: StudyTaskStatus
-  targetCount: number
   roundSize: PairCount
   plannedWordIds: string[]
   completedWordIds: string[]
-  reviewQueueWordIds: string[]
-  reviewedWordIds: string[]
   currentRoundWordIds: string[]
-  currentMissesByWord: Record<string, number>
+  mistakesByWord: Record<string, number>
   currentMatchedWordIds: string[]
   roundNumber: number
   durationSeconds: number
@@ -95,12 +85,6 @@ export interface StudyTask {
   startedAt: number
   completedAt: number | null
   updatedAt: number
-}
-
-export interface WordReviewOutcome {
-  wordId: string
-  misses: number
-  rating: ReviewRating
 }
 
 export type AppTheme = 'light' | 'dark'
@@ -141,13 +125,12 @@ export interface ParsedImport {
 
 export interface LearningStats {
   total: number
-  unlearned: number
+  new: number
   learning: number
-  fuzzy: number
+  weak: number
   familiar: number
   mastered: number
   due: number
-  weak: number
 }
 
 export const DEFAULT_GAME_SETTINGS: GameSettings = {

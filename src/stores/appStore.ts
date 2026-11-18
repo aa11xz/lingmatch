@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { DEFAULT_GAME_SETTINGS, type AppTheme, type GameResult, type GameSettings, type WordLibrary } from '../types/domain'
-import { getLibraries, getRecentResults, loadSettings, loadTheme, saveGameResult, saveSettings, saveTheme } from '../features/library/libraryService'
+import { getLibraries, getRecentResults, loadSettings, loadTheme, saveSettings, saveTheme } from '../features/library/libraryService'
 
 interface AppState {
   libraries: WordLibrary[]
@@ -14,7 +14,6 @@ interface AppState {
   refreshHistory(): Promise<void>
   persistSettings(settings: GameSettings): Promise<void>
   persistTheme(theme: AppTheme): Promise<void>
-  persistResult(result: GameResult): Promise<void>
   setError(error: string): void
 }
 
@@ -51,10 +50,6 @@ export const useAppStore = create<AppState>((set) => ({
   async persistTheme(theme) {
     await saveTheme(theme)
     set({ theme })
-  },
-  async persistResult(result) {
-    await saveGameResult(result)
-    set({ history: await getRecentResults() })
   },
   setError(error) {
     set({ error })

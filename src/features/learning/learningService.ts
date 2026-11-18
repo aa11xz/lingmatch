@@ -1,18 +1,16 @@
 import { db } from '../../db/database'
-import { applyPracticeOutcome, createDefaultLearningProfile, setManualLearningStatus } from './learningEngine'
-import { nextRoundWordIds, planStudyWordIds } from './schedulingEngine'
+import { applyPracticeOutcome, createDefaultWordProgress } from './learningEngine'
+import { nextRoundWordIds, selectCandidateWordIds } from './schedulingEngine'
 import type {
   GameResult,
   LearningStats,
   PairCount,
   PracticeEvent,
   PracticeMode,
-  ReviewRating,
   StudyTask,
   StudyTaskMode,
   WordEntry,
-  WordLearningProfile,
-  WordLearningStatus,
+  WordProgress,
 } from '../../types/domain'
 
 export interface StudyTaskBundle {
@@ -24,62 +22,139 @@ export interface CompletedRoundResult extends StudyTaskBundle {
   result: GameResult
 }
 
+export interface LearningDashboard {
+  stats: LearningStats
+  total: number
+  new: number
+  learning: number
+  weak: number
+  familiar: number
+  mastered: number
+  due: number
+  candidateWordCounts: Record<StudyTaskMode, number>
+  currentTask?: StudyTask
+  resumableTask?: StudyTask
+  unfinishedTasks: StudyTask[]
+  pausedTasks: StudyTask[]
+  recentCompletedTasks: StudyTask[]
+}
+
 const now = () => Date.now()
 const makeId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
 const roundId = (taskId: string, roundNumber: number) => `${taskId}:round:${roundNumber}`
+const activeTask = (task: StudyTask) => task.status === 'in-progress' || task.status === 'paused'
 
 async function getTaskWords(ids: readonly string[]): Promise<WordEntry[]> {
-  const rows = await db.words.bulkGet([...new Set(ids)])
+  const uniqueIds = [...new Set(ids)]
+  const rows = await db.words.bulkGet(uniqueIds)
   const byId = new Map(rows.filter((word): word is WordEntry => Boolean(word)).map((word) => [word.id, word]))
-  return ids.flatMap((id) => {
+  return uniqueIds.flatMap((id) => {
     const word = byId.get(id)
     return word ? [word] : []
   })
 }
 
+function practicedIds(events: readonly PracticeEvent[]): Set<string> {
+  return new Set(events.map((event) => event.wordId))
+}
+
+function makeStats(words: readonly WordEntry[], progress: readonly WordProgress[], nowAt: number): LearningStats {
+  const byId = new Map(progress.map((item) => [item.wordId, item]))
+  const stats: LearningStats = { total: words.length, new: 0, learning: 0, weak: 0, familiar: 0, mastered: 0, due: 0 }
+  for (const word of words) {
+    const state = byId.get(word.id)?.state ?? 'new'
+    stats[state] += 1
+    const dueAt = byId.get(word.id)?.nextReviewAt
+    if (dueAt !== null && dueAt !== undefined && dueAt <= nowAt) stats.due += 1
+  }
+  return stats
+}
+
+async function readCandidateIds(libraryId: string, mode: StudyTaskMode, timestamp: number): Promise<string[]> {
+  const [words, progress, events] = await Promise.all([
+    db.words.where('libraryId').equals(libraryId).toArray(),
+    db.wordProgress.where('libraryId').equals(libraryId).toArray(),
+    mode === 'new' ? db.practiceEvents.where('libraryId').equals(libraryId).toArray() : Promise.resolve([] as PracticeEvent[]),
+  ])
+  return selectCandidateWordIds({ words, progress, mode, now: timestamp, practicedWordIds: practicedIds(events) })
+}
+
+/** Returns the canonical, unique candidate set used by both Dashboard and tasks. */
+export async function getCandidateWordIds(libraryId: string, mode: StudyTaskMode, timestamp = now()): Promise<string[]> {
+  return db.transaction('r', db.words, db.wordProgress, db.practiceEvents, () => readCandidateIds(libraryId, mode, timestamp))
+}
+
 export async function createStudyTask(input: {
   libraryId: string
-  mode?: StudyTaskMode
+  mode: StudyTaskMode
   practiceMode?: PracticeMode
   targetCount?: number
   roundSize: PairCount
   timestamp?: number
 }): Promise<StudyTaskBundle> {
   const timestamp = input.timestamp ?? now()
-  const mode = input.mode ?? 'mixed'
-  const task = await db.transaction('rw', db.words, db.learningProfiles, db.studyTasks, async () => {
-    const existingTask = await db.studyTasks.where('libraryId').equals(input.libraryId).filter((candidate) => candidate.status !== 'completed').first()
-    if (existingTask) throw new Error('这个词库还有一项未完成的学习任务，请先继续完成后再开始新任务。')
-    const words = (await db.words.where('libraryId').equals(input.libraryId).toArray()).filter((word) => word.archivedAt === undefined)
-    if (!words.length) throw new Error('这个词库没有可练习的词条。')
+  const task = await db.transaction('rw', db.libraries, db.words, db.wordProgress, db.practiceEvents, db.studyTasks, async () => {
+    const library = await db.libraries.get(input.libraryId)
+    if (!library) throw new Error('找不到这个词库。')
+    const [words, progress, events, tasks] = await Promise.all([
+      db.words.where('libraryId').equals(input.libraryId).toArray(),
+      db.wordProgress.where('libraryId').equals(input.libraryId).toArray(),
+      db.practiceEvents.where('libraryId').equals(input.libraryId).toArray(),
+      db.studyTasks.where('libraryId').equals(input.libraryId).toArray(),
+    ])
+    const activeForMode = tasks.filter((candidate) => candidate.mode === input.mode && activeTask(candidate))
+      .sort((left, right) => Number(right.status === 'in-progress') - Number(left.status === 'in-progress')
+        || right.updatedAt - left.updatedAt || right.startedAt - left.startedAt)
+    const existing = activeForMode[0]
 
-    const existingProfiles = await db.learningProfiles.where('libraryId').equals(input.libraryId).toArray()
-    const profilesById = new Map(existingProfiles.map((profile) => [profile.wordId, profile]))
-    const missingProfiles = words.filter((word) => !profilesById.has(word.id)).map((word) => createDefaultLearningProfile(word, timestamp))
-    if (missingProfiles.length) await db.learningProfiles.bulkAdd(missingProfiles)
-    const profiles = [...existingProfiles, ...missingProfiles]
-    const targetCount = Math.max(1, Math.floor(input.targetCount ?? 50))
-    const plannedWordIds = planStudyWordIds(words, profiles, mode, targetCount, timestamp)
+    // A mode has one resumable snapshot. If old imported data contains duplicates,
+    // retire extras before any new task can be created for that mode.
+    for (const duplicate of activeForMode.slice(1)) {
+      await db.studyTasks.update(duplicate.id, { status: 'superseded', updatedAt: timestamp })
+    }
+    if (existing) {
+      for (const running of tasks.filter((candidate) => candidate.status === 'in-progress' && candidate.id !== existing.id)) {
+        await db.studyTasks.update(running.id, { status: 'paused', updatedAt: timestamp })
+      }
+      const resumed = { ...existing, status: 'in-progress' as const, updatedAt: timestamp }
+      await db.studyTasks.put(resumed)
+      return resumed
+    }
+
+    const candidateIds = selectCandidateWordIds({
+      words,
+      progress,
+      mode: input.mode,
+      now: timestamp,
+      practicedWordIds: practicedIds(events),
+    })
+    const plannedWordIds = input.mode === 'new'
+      ? candidateIds.slice(0, Math.max(0, Math.floor(input.targetCount ?? 50)))
+      : candidateIds
     if (!plannedWordIds.length) {
-      const message = mode === 'new' ? '这个词库暂时没有未学习的新词。' : mode === 'due' ? '现在没有到期的复习词。' : '当前筛选没有可练习的单词。'
+      const message = input.mode === 'due' ? '现在没有到期的复习词。'
+        : input.mode === 'weak' ? '当前没有需要强化的薄弱词。'
+          : input.mode === 'new' ? '这个词库暂时没有未学习的新词。'
+            : '这个词库没有可练习的词条。'
       throw new Error(message)
+    }
+
+    for (const running of tasks.filter((candidate) => candidate.status === 'in-progress')) {
+      await db.studyTasks.update(running.id, { status: 'paused', updatedAt: timestamp })
     }
 
     const currentRoundWordIds = plannedWordIds.slice(0, input.roundSize)
     const created: StudyTask = {
       id: makeId(),
       libraryId: input.libraryId,
-      mode,
+      mode: input.mode,
       practiceMode: input.practiceMode ?? 'match',
       status: 'in-progress',
-      targetCount,
       roundSize: input.roundSize,
       plannedWordIds,
       completedWordIds: [],
-      reviewQueueWordIds: [],
-      reviewedWordIds: [],
       currentRoundWordIds,
-      currentMissesByWord: {},
+      mistakesByWord: {},
       currentMatchedWordIds: [],
       roundNumber: 1,
       durationSeconds: 0,
@@ -95,19 +170,34 @@ export async function createStudyTask(input: {
 }
 
 export async function getResumableStudyTask(libraryId?: string): Promise<StudyTask | undefined> {
+  const candidates = await getUnfinishedStudyTasks(libraryId)
+  return candidates.find((task) => task.status === 'in-progress') ?? candidates[0]
+}
+
+export async function getUnfinishedStudyTasks(libraryId?: string): Promise<StudyTask[]> {
   const candidates = libraryId
     ? await db.studyTasks.where('libraryId').equals(libraryId).toArray()
-    : await db.studyTasks.orderBy('startedAt').toArray()
-  return candidates
-    .filter((task) => task.status !== 'completed')
-    .sort((left, right) => right.startedAt - left.startedAt)[0]
+    : await db.studyTasks.toArray()
+  return candidates.filter(activeTask)
+    .sort((left, right) => right.updatedAt - left.updatedAt || right.startedAt - left.startedAt)
+}
+
+export async function getPausedStudyTasks(libraryId?: string): Promise<StudyTask[]> {
+  return (await getUnfinishedStudyTasks(libraryId)).filter((task) => task.status === 'paused')
+}
+
+export async function getCurrentStudyTask(libraryId: string): Promise<StudyTask | undefined> {
+  return db.studyTasks.where('[libraryId+status]').equals([libraryId, 'in-progress']).first()
 }
 
 export async function resumeStudyTask(taskId: string): Promise<StudyTaskBundle> {
   const task = await db.transaction('rw', db.studyTasks, async () => {
     const current = await db.studyTasks.get(taskId)
-    if (!current || current.status === 'completed') throw new Error('这次学习任务已经结束，请开始一项新任务。')
-    const resumed = { ...current, status: 'in-progress' as const, updatedAt: now() }
+    if (!current || !activeTask(current)) throw new Error('这次学习任务已经结束，请开始一项新任务。')
+    const others = await db.studyTasks.where('[libraryId+status]').equals([current.libraryId, 'in-progress']).toArray()
+    const timestamp = now()
+    for (const other of others) if (other.id !== taskId) await db.studyTasks.update(other.id, { status: 'paused', updatedAt: timestamp })
+    const resumed = { ...current, status: 'in-progress' as const, updatedAt: timestamp }
     await db.studyTasks.put(resumed)
     return resumed
   })
@@ -136,14 +226,15 @@ export async function recordPairResolution(input: {
     if (input.correct !== (input.englishWordId === input.chineseWordId)) throw new Error('配对结果与词条不一致，未保存。')
 
     const matched = new Set(task.currentMatchedWordIds)
-    const misses = { ...task.currentMissesByWord }
-    if (input.correct) {
-      matched.add(input.englishWordId)
-    } else {
-      misses[input.englishWordId] = (misses[input.englishWordId] ?? 0) + 1
-      misses[input.chineseWordId] = (misses[input.chineseWordId] ?? 0) + 1
+    if (input.correct && matched.has(input.englishWordId)) return task
+    if (!input.correct && (matched.has(input.englishWordId) || matched.has(input.chineseWordId))) return task
+    const mistakesByWord = { ...task.mistakesByWord }
+    if (input.correct) matched.add(input.englishWordId)
+    else {
+      mistakesByWord[input.englishWordId] = (mistakesByWord[input.englishWordId] ?? 0) + 1
+      mistakesByWord[input.chineseWordId] = (mistakesByWord[input.chineseWordId] ?? 0) + 1
     }
-    const next = { ...task, currentMatchedWordIds: [...matched], currentMissesByWord: misses, updatedAt: now() }
+    const next = { ...task, currentMatchedWordIds: [...matched], mistakesByWord, updatedAt: now() }
     await db.studyTasks.put(next)
     return next
   })
@@ -152,136 +243,125 @@ export async function recordPairResolution(input: {
 export async function completeStudyRound(input: {
   taskId: string
   roundNumber: number
-  ratings: Record<string, ReviewRating>
   durationSeconds: number
   timestamp?: number
 }): Promise<CompletedRoundResult> {
   const timestamp = input.timestamp ?? now()
-  const committed = await db.transaction('rw', db.studyTasks, db.learningProfiles, db.practiceEvents, db.results, async () => {
+  const committed = await db.transaction('rw', db.studyTasks, db.wordProgress, db.practiceEvents, db.results, async () => {
     const task = await db.studyTasks.get(input.taskId)
     if (!task || task.status !== 'in-progress' || task.roundNumber !== input.roundNumber) throw new Error('这一轮已经保存或发生变化，请返回任务页面。')
     const currentIds = [...new Set(task.currentRoundWordIds)]
+    if (!currentIds.length || currentIds.some((id) => !task.plannedWordIds.includes(id))) throw new Error('本轮词条与任务计划不一致。')
     const matched = new Set(task.currentMatchedWordIds)
-    if (!currentIds.length || currentIds.some((id) => !matched.has(id))) throw new Error('请先完成本轮所有配对。')
-    if (currentIds.some((id) => !input.ratings[id])) throw new Error('请为本轮每个单词选择一次记忆反馈。')
+    if (currentIds.some((id) => !matched.has(id))) throw new Error('请先完成本轮所有配对。')
 
     const id = roundId(task.id, task.roundNumber)
     if (await db.results.get(id)) throw new Error('这一轮已经写入历史记录，避免重复计数。')
-    const priorProfiles = await db.learningProfiles.bulkGet(currentIds)
-    const profileById = new Map(priorProfiles.filter((profile): profile is WordLearningProfile => Boolean(profile)).map((profile) => [profile.wordId, profile]))
-    const events: PracticeEvent[] = []
-    const profiles: WordLearningProfile[] = []
     for (const wordId of currentIds) {
-      const misses = task.currentMissesByWord[wordId] ?? 0
-      const rating = input.ratings[wordId]!
-      const previous = profileById.get(wordId) ?? createDefaultLearningProfile({ id: wordId, libraryId: task.libraryId }, timestamp)
-      profiles.push(applyPracticeOutcome(previous, { misses, rating }, timestamp))
+      const existingEvent = await db.practiceEvents.where('[taskId+roundId+wordId]')
+        .equals([task.id, id, wordId]).first()
+      if (existingEvent) throw new Error('这一轮已经写入练习记录，避免重复计数。')
+    }
+    const prior = await db.wordProgress.bulkGet(currentIds)
+    const progressById = new Map(prior.filter((item): item is WordProgress => Boolean(item)).map((item) => [item.wordId, item]))
+    const progress: WordProgress[] = []
+    const events: PracticeEvent[] = []
+    for (const wordId of currentIds) {
+      const mistakes = Math.max(0, Math.floor(task.mistakesByWord[wordId] ?? 0))
+      const previous = progressById.get(wordId) ?? createDefaultWordProgress({ id: wordId, libraryId: task.libraryId }, timestamp)
+      progress.push(applyPracticeOutcome(previous, { mistakes, firstTryCorrect: mistakes === 0 }, timestamp))
       events.push({
         id: `${id}:${wordId}`,
         wordId,
         libraryId: task.libraryId,
         taskId: task.id,
         roundId: id,
-        roundNumber: task.roundNumber,
-        mode: task.practiceMode,
-        correct: misses === 0,
-        misses,
-        rating,
+        mode: task.mode,
+        mistakes,
+        firstTryCorrect: mistakes === 0,
         practicedAt: timestamp,
       })
     }
-    await db.learningProfiles.bulkPut(profiles)
+    await db.wordProgress.bulkPut(progress)
     await db.practiceEvents.bulkAdd(events)
 
-    const totalMisses = Object.values(task.currentMissesByWord).reduce((sum, value) => sum + value, 0)
+    const totalMistakes = Object.values(task.mistakesByWord).reduce((sum, value) => sum + value, 0)
     const result: GameResult = {
       id,
       libraryId: task.libraryId,
       totalPairs: currentIds.length,
-      correctPairs: currentIds.filter((wordId) => (task.currentMissesByWord[wordId] ?? 0) === 0).length,
+      correctPairs: currentIds.filter((wordId) => (task.mistakesByWord[wordId] ?? 0) === 0).length,
       duration: Math.max(0, Math.floor(input.durationSeconds)),
       completedAt: timestamp,
-      mistakes: Math.ceil(totalMisses / 2),
+      mistakes: Math.ceil(totalMistakes / 2),
       taskId: task.id,
       roundNumber: task.roundNumber,
       mode: task.practiceMode,
     }
     await db.results.add(result)
 
-    const completedSet = new Set(task.completedWordIds)
-    const plannedSet = new Set(task.plannedWordIds)
-    for (const wordId of currentIds) if (plannedSet.has(wordId)) completedSet.add(wordId)
-    const reviewed = new Set(task.reviewedWordIds)
-    const reviewQueue = [...task.reviewQueueWordIds]
-    for (const wordId of currentIds) {
-      if ((task.currentMissesByWord[wordId] ?? 0) > 0 && !reviewed.has(wordId) && !reviewQueue.includes(wordId)) reviewQueue.push(wordId)
-    }
-
-    const queueProfiles = await db.learningProfiles.bulkGet(reviewQueue)
-    const profilesForScheduling = new Map<string, WordLearningProfile>()
-    for (const profile of queueProfiles) if (profile) profilesForScheduling.set(profile.wordId, profile)
-    for (const profile of profiles) profilesForScheduling.set(profile.wordId, profile)
-    const next = nextRoundWordIds({
-      plannedWordIds: task.plannedWordIds,
-      completedWordIds: [...completedSet],
-      reviewQueueWordIds: reviewQueue,
-      reviewedWordIds: task.reviewedWordIds,
-      profiles: [...profilesForScheduling.values()],
-      roundSize: task.roundSize,
-      now: timestamp,
-    })
-    const nextRoundNumber = task.roundNumber + (next.wordIds.length ? 1 : 0)
-    const isComplete = next.wordIds.length === 0
+    const completed = new Set(task.completedWordIds)
+    const planned = new Set(task.plannedWordIds)
+    for (const wordId of currentIds) if (planned.has(wordId)) completed.add(wordId)
+    const completedWordIds = [...planned].filter((wordId) => completed.has(wordId))
+    const nextWords = nextRoundWordIds({ plannedWordIds: task.plannedWordIds, completedWordIds, roundSize: task.roundSize })
+    const isComplete = completedWordIds.length === planned.size
     const updatedTask: StudyTask = {
       ...task,
-      completedWordIds: [...completedSet],
-      reviewQueueWordIds: next.remainingReviewQueue,
-      reviewedWordIds: next.reviewedWordIds,
-      currentRoundWordIds: next.wordIds,
-      currentMissesByWord: {},
+      completedWordIds,
+      currentRoundWordIds: nextWords,
+      mistakesByWord: {},
       currentMatchedWordIds: [],
-      roundNumber: nextRoundNumber,
+      roundNumber: task.roundNumber + (nextWords.length ? 1 : 0),
       status: isComplete ? 'completed' : 'in-progress',
       durationSeconds: task.durationSeconds + result.duration,
-      totalMistakes: task.totalMistakes + result.mistakes! ,
+      totalMistakes: task.totalMistakes + (result.mistakes ?? 0),
       completedAt: isComplete ? timestamp : null,
       updatedAt: timestamp,
     }
     await db.studyTasks.put(updatedTask)
     return { task: updatedTask, result }
   })
-
   return { ...committed, words: await getTaskWords(committed.task.currentRoundWordIds) }
 }
 
-export async function getLearningProfiles(libraryId: string): Promise<WordLearningProfile[]> {
-  return db.learningProfiles.where('libraryId').equals(libraryId).toArray()
+export async function getLearningProgress(libraryId: string): Promise<WordProgress[]> {
+  return db.wordProgress.where('libraryId').equals(libraryId).toArray()
 }
 
-export async function getLearningStats(libraryId: string, timestamp = now()): Promise<LearningStats> {
-  const [words, profiles] = await Promise.all([
-    db.words.where('libraryId').equals(libraryId).filter((word) => word.archivedAt === undefined).toArray(),
-    getLearningProfiles(libraryId),
-  ])
-  const byId = new Map(profiles.map((profile) => [profile.wordId, profile]))
-  const stats: LearningStats = { total: words.length, unlearned: 0, learning: 0, fuzzy: 0, familiar: 0, mastered: 0, due: 0, weak: 0 }
-  for (const word of words) {
-    const profile = byId.get(word.id) ?? createDefaultLearningProfile(word, timestamp)
-    stats[profile.status] += 1
-    if (profile.nextReviewAt !== null && profile.nextReviewAt <= timestamp) stats.due += 1
-    if (profile.incorrectCount > 0 && profile.status !== 'mastered') stats.weak += 1
-  }
-  return stats
-}
-
-export async function setWordLearningStatus(wordId: string, status: WordLearningStatus): Promise<WordLearningProfile> {
-  return db.transaction('rw', db.words, db.learningProfiles, async () => {
-    const word = await db.words.get(wordId)
-    if (!word) throw new Error('找不到这个单词。')
-    const profile = await db.learningProfiles.get(wordId) ?? createDefaultLearningProfile(word)
-    const updated = setManualLearningStatus(profile, status)
-    await db.learningProfiles.put(updated)
-    return updated
+export async function getLearningDashboard(libraryId: string, timestamp = now()): Promise<LearningDashboard> {
+  return db.transaction('r', db.words, db.wordProgress, db.practiceEvents, db.studyTasks, async () => {
+    const [allWords, progress, events, tasks] = await Promise.all([
+      db.words.where('libraryId').equals(libraryId).toArray(),
+      db.wordProgress.where('libraryId').equals(libraryId).toArray(),
+      db.practiceEvents.where('libraryId').equals(libraryId).toArray(),
+      db.studyTasks.where('libraryId').equals(libraryId).toArray(),
+    ])
+    const words = allWords.filter((word) => word.archivedAt === undefined)
+    const practiced = practicedIds(events)
+    const candidateWordCounts: Record<StudyTaskMode, number> = {
+      due: selectCandidateWordIds({ words, progress, mode: 'due', now: timestamp }).length,
+      weak: selectCandidateWordIds({ words, progress, mode: 'weak', now: timestamp }).length,
+      new: selectCandidateWordIds({ words, progress, mode: 'new', now: timestamp, practicedWordIds: practiced }).length,
+      comprehensive: selectCandidateWordIds({ words, progress, mode: 'comprehensive', now: timestamp }).length,
+    }
+    const stats = makeStats(words, progress, timestamp)
+    stats.new = candidateWordCounts.new
+    const sorted = tasks.filter((task) => task.status !== 'superseded')
+      .sort((left, right) => right.updatedAt - left.updatedAt || right.startedAt - left.startedAt)
+    const unfinishedTasks = sorted.filter(activeTask)
+    const pausedTasks = unfinishedTasks.filter((task) => task.status === 'paused')
+    const currentTask = unfinishedTasks.find((task) => task.status === 'in-progress')
+    return {
+      stats,
+      ...stats,
+      candidateWordCounts,
+      currentTask,
+      resumableTask: currentTask ?? pausedTasks[0],
+      unfinishedTasks,
+      pausedTasks,
+      recentCompletedTasks: sorted.filter((task) => task.status === 'completed').slice(0, 5),
+    }
   })
 }
 

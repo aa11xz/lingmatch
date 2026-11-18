@@ -26,6 +26,48 @@ jobs:
           java-version: '21'
           cache: gradle
 
+      - name: Check persistent signing secrets
+        env:
+          LINGMATCH_KEYSTORE_BASE64: ${{ secrets.LINGMATCH_KEYSTORE_BASE64 }}
+          LINGMATCH_KEY_ALIAS: ${{ secrets.LINGMATCH_KEY_ALIAS }}
+          LINGMATCH_KEYSTORE_PASSWORD: ${{ secrets.LINGMATCH_KEYSTORE_PASSWORD }}
+          LINGMATCH_KEY_PASSWORD: ${{ secrets.LINGMATCH_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          if [[ -z "$LINGMATCH_KEYSTORE_BASE64" || -z "$LINGMATCH_KEY_ALIAS" || -z "$LINGMATCH_KEYSTORE_PASSWORD" || -z "$LINGMATCH_KEY_PASSWORD" ]]; then
+            echo "Persistent signing secrets are required. Compare the installed APK certificate before adding them."
+            exit 1
+          fi
+          PIN_COUNT="$(grep -c '^lingmatchExpectedCertSha256=' android/gradle.properties || true)"
+          if [[ "$PIN_COUNT" != "1" ]]; then
+            echo "android/gradle.properties must contain exactly one confirmed signing certificate pin."
+            exit 1
+          fi
+          EXPECTED_FINGERPRINT="$(sed -n 's/^lingmatchExpectedCertSha256=//p' android/gradle.properties | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+          if [[ ! "$EXPECTED_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "The source-controlled release certificate pin is invalid."
+            exit 1
+          fi
+          echo "LINGMATCH_EXPECTED_CERT_SHA256=$EXPECTED_FINGERPRINT" >> "$GITHUB_ENV"
+
+      - name: Decode persistent signing key
+        env:
+          LINGMATCH_KEYSTORE_BASE64: ${{ secrets.LINGMATCH_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          KEYSTORE_PATH="$RUNNER_TEMP/lingmatch-release.keystore"
+          echo "LINGMATCH_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          printf '%s' "$LINGMATCH_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+
+      - name: Set release version
+        shell: bash
+        run: |
+          VERSION_CODE=$((GITHUB_RUN_NUMBER + 4))
+          VERSION_NAME="2.0.$((GITHUB_RUN_NUMBER + 1))"
+          echo "LINGMATCH_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "LINGMATCH_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "Building LingMatch $VERSION_NAME (versionCode $VERSION_CODE)"
+
       - name: Install dependencies
         run: npm ci
 
@@ -35,14 +77,59 @@ jobs:
       - name: Sync Android project
         run: npx cap sync android
 
-      - name: Build APK
+      - name: Build signed release APK
         working-directory: android
-        run: chmod +x ./gradlew && ./gradlew --no-daemon assembleDebug
+        env:
+          LINGMATCH_KEY_ALIAS: ${{ secrets.LINGMATCH_KEY_ALIAS }}
+          LINGMATCH_KEYSTORE_PASSWORD: ${{ secrets.LINGMATCH_KEYSTORE_PASSWORD }}
+          LINGMATCH_KEY_PASSWORD: ${{ secrets.LINGMATCH_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleRelease \
+            -PlingmatchVersionCode="$LINGMATCH_VERSION_CODE" \
+            -PlingmatchVersionName="$LINGMATCH_VERSION_NAME"
 
-      - name: Upload APK
+      - name: Verify signed APK certificate fingerprint
+        shell: bash
+        run: |
+          APK_PATH="android/app/build/outputs/apk/release/app-release.apk"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$SDK_ROOT" || ! -d "$SDK_ROOT/build-tools" ]]; then
+            echo "Android SDK build-tools are unavailable; cannot verify the signed APK."
+            exit 1
+          fi
+          APKSIGNER="$(find "$SDK_ROOT/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [[ -z "$APKSIGNER" || ! -f "$APK_PATH" ]]; then
+            echo "apksigner or the release APK is unavailable; cannot verify the signed APK."
+            exit 1
+          fi
+          VERIFY_OUTPUT="$("$APKSIGNER" verify --print-certs "$APK_PATH")"
+          SIGNER_FINGERPRINTS="$(printf '%s\n' "$VERIFY_OUTPUT" | sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p')"
+          SIGNER_COUNT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
+          if [[ "$SIGNER_COUNT" != "1" ]]; then
+            echo "Expected exactly one APK signer certificate, found $SIGNER_COUNT."
+            exit 1
+          fi
+          ACTUAL_FINGERPRINT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed -n '1p' | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+          if [[ "$ACTUAL_FINGERPRINT" != "$LINGMATCH_EXPECTED_CERT_SHA256" ]]; then
+            echo "Release APK certificate fingerprint does not match the confirmed installed certificate."
+            exit 1
+          fi
+          echo "Release APK certificate fingerprint verified."
+
+      - name: Upload signed APK
         uses: actions/upload-artifact@v7
         with:
-          name: lingmatch-android-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: lingmatch-release-${{ github.run_number }}
+          path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 90
+
+      - name: Remove signing key from runner temp
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "$LINGMATCH_KEYSTORE_PATH" && -f "$LINGMATCH_KEYSTORE_PATH" ]]; then
+            rm -f "$LINGMATCH_KEYSTORE_PATH"
+          fi

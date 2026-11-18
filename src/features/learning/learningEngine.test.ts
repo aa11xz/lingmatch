@@ -1,61 +1,107 @@
 import { describe, expect, it } from 'vitest'
-import { applyPracticeOutcome, createDefaultLearningProfile, setManualLearningStatus } from './learningEngine'
-import type { WordEntry, WordLearningProfile } from '../../types/domain'
+import type { WordEntry, WordProgress } from '../../types/domain'
+import { applyPracticeOutcome, createDefaultWordProgress } from './learningEngine'
 
 const DAY = 24 * 60 * 60 * 1000
 const word: WordEntry = { id: 'word-1', libraryId: 'library-1', english: 'apple', chinese: '苹果', createdAt: 1 }
 
 describe('learningEngine', () => {
-  it('starts words as unlearned and does not equate one correct match with mastery', () => {
-    const initial = createDefaultLearningProfile(word, 100)
-    const practiced = applyPracticeOutcome(initial, { misses: 0, rating: 'remembered' }, 200)
+  it('starts each word in new and moves it into learning after its first clean session', () => {
+    const initial = createDefaultWordProgress(word, 100)
+    const practiced = applyPracticeOutcome(initial, { mistakes: 0, firstTryCorrect: true }, 200)
 
-    expect(initial.status).toBe('unlearned')
-    expect(practiced.status).toBe('learning')
-    expect(practiced.repetitions).toBe(1)
-    expect(practiced.intervalDays).toBe(1)
-    expect(practiced.nextReviewAt).toBe(200 + DAY)
-    expect(practiced.statusSource).toBe('system')
+    expect(initial).toEqual({
+      wordId: word.id,
+      libraryId: word.libraryId,
+      state: 'new',
+      correctSessions: 0,
+      wrongSessions: 0,
+      consecutiveCorrect: 0,
+      lastPracticedAt: null,
+      lastWrongAt: null,
+      nextReviewAt: null,
+      updatedAt: 100,
+    })
+    expect(practiced).toMatchObject({
+      state: 'learning',
+      correctSessions: 1,
+      wrongSessions: 0,
+      consecutiveCorrect: 1,
+      lastPracticedAt: 200,
+      nextReviewAt: 200 + DAY,
+    })
   })
 
-  it('extends intervals only after due reviews and reaches mastery after spaced successes', () => {
-    let profile: WordLearningProfile = createDefaultLearningProfile(word, 0)
-    let now = 1_000
-    for (let repetition = 0; repetition < 5; repetition += 1) {
-      profile = applyPracticeOutcome(profile, { misses: 0, rating: 'remembered' }, now)
-      if (repetition < 4) {
-        const priorInterval = profile.intervalDays
-        profile = applyPracticeOutcome(profile, { misses: 0, rating: 'remembered' }, now + 1)
-        expect(profile.intervalDays).toBe(priorInterval)
-      }
-      now = (profile.nextReviewAt ?? now) + 1
+  it('uses fixed spaced intervals and advances to familiar then mastered gradually', () => {
+    let progress: WordProgress = createDefaultWordProgress(word, 0)
+    let practicedAt = 1_000
+    const expectedIntervals = [1, 3, 7, 14, 30]
+
+    for (const [index, intervalDays] of expectedIntervals.entries()) {
+      progress = applyPracticeOutcome(progress, { mistakes: 0, firstTryCorrect: true }, practicedAt)
+      expect(progress.nextReviewAt).toBe(practicedAt + intervalDays * DAY)
+      if (index < 2) expect(progress.state).toBe('learning')
+      if (index === 2 || index === 3) expect(progress.state).toBe('familiar')
+      if (index === 4) expect(progress.state).toBe('mastered')
+      practicedAt = progress.nextReviewAt! + 1
+    }
+    expect(progress.correctSessions).toBe(5)
+    expect(progress.consecutiveCorrect).toBe(5)
+  })
+
+  it('moves a word to weak on any mistake and returns it to learning after a clean reinforcement', () => {
+    const learning = {
+      ...createDefaultWordProgress(word, 0),
+      state: 'familiar' as const,
+      correctSessions: 4,
+      consecutiveCorrect: 3,
+      nextReviewAt: 5_000,
+    }
+    const missed = applyPracticeOutcome(learning, { mistakes: 2, firstTryCorrect: false }, 10_000)
+
+    expect(missed).toMatchObject({
+      state: 'weak',
+      correctSessions: 4,
+      wrongSessions: 1,
+      consecutiveCorrect: 0,
+      lastWrongAt: 10_000,
+      nextReviewAt: 10_000 + 15 * 60 * 1000,
+    })
+
+    const corrected = applyPracticeOutcome(missed, { mistakes: 0, firstTryCorrect: true }, 11_000)
+    expect(corrected.state).toBe('learning')
+    expect(corrected.wrongSessions).toBe(1)
+    expect(corrected.consecutiveCorrect).toBe(1)
+    expect(corrected.lastWrongAt).toBe(10_000)
+  })
+
+  it('treats a failed first-try result as incorrect even when the mistake count is zero', () => {
+    const failedFirstTry = applyPracticeOutcome(
+      createDefaultWordProgress(word, 100),
+      { mistakes: 0, firstTryCorrect: false },
+      200,
+    )
+
+    expect(failedFirstTry).toMatchObject({
+      state: 'weak',
+      correctSessions: 0,
+      wrongSessions: 1,
+      consecutiveCorrect: 0,
+      lastWrongAt: 200,
+    })
+  })
+
+  it('does not advance the review interval for an early correct retry', () => {
+    const progress: WordProgress = {
+      ...createDefaultWordProgress(word, 0),
+      state: 'learning',
+      correctSessions: 1,
+      consecutiveCorrect: 1,
+      nextReviewAt: 50_000,
     }
 
-    expect(profile.status).toBe('mastered')
-    expect(profile.repetitions).toBe(5)
-    expect(profile.intervalDays).toBeGreaterThanOrEqual(14)
-  })
-
-  it('schedules forgotten and uncertain feedback soon, and reopens a mastered word after an error', () => {
-    const mastered = setManualLearningStatus(createDefaultLearningProfile(word, 0), 'mastered', 1_000)
-    const forgotten = applyPracticeOutcome(mastered, { misses: 1, rating: 'forgotten' }, 2_000)
-    const uncertain = applyPracticeOutcome(mastered, { misses: 0, rating: 'uncertain' }, 2_000)
-
-    expect(forgotten.status).toBe('learning')
-    expect(forgotten.consecutiveCorrect).toBe(0)
-    expect(forgotten.nextReviewAt).toBe(2_000 + 15 * 60 * 1000)
-    expect(uncertain.status).toBe('fuzzy')
-    expect(uncertain.nextReviewAt).toBe(2_000 + 3 * DAY)
-  })
-
-  it('keeps manual status until a new answer updates the profile', () => {
-    const manual = setManualLearningStatus(createDefaultLearningProfile(word, 0), 'familiar', 10_000)
-    const practiced = applyPracticeOutcome(manual, { misses: 1, rating: 'uncertain' }, 20_000)
-
-    expect(manual.status).toBe('familiar')
-    expect(manual.statusSource).toBe('manual')
-    expect(practiced.status).toBe('fuzzy')
-    expect(practiced.statusSource).toBe('system')
-    expect(practiced.incorrectCount).toBe(1)
+    const earlyRetry = applyPracticeOutcome(progress, { mistakes: 0, firstTryCorrect: true }, 49_999)
+    expect(earlyRetry.nextReviewAt).toBe(50_000)
+    expect(earlyRetry.state).toBe('learning')
   })
 })
