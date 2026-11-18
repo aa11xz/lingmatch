@@ -104,14 +104,15 @@ jobs:
             echo "apksigner or the release APK is unavailable; cannot verify the signed APK."
             exit 1
           fi
-          VERIFY_OUTPUT="$("$APKSIGNER" verify --print-certs "$APK_PATH" 2>&1)"
-          SIGNER_FINGERPRINTS="$(printf '%s\n' "$VERIFY_OUTPUT" | sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p')"
+          VERIFY_OUTPUT="$("$APKSIGNER" verify --verbose --print-certs "$APK_PATH" 2>&1)"
+          SIGNER_FINGERPRINTS="$(printf '%s\n' "$VERIFY_OUTPUT" | grep -Eio '^Signer #[0-9]+ certificate SHA-256 digest: [0-9a-f:]+' | sed -E 's/^Signer #[0-9]+ certificate SHA-256 digest: //I' | tr '[:upper:]' '[:lower:]' | tr -d ':')"
           SIGNER_COUNT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
           if [[ "$SIGNER_COUNT" != "1" ]]; then
             echo "Expected exactly one APK signer certificate, found $SIGNER_COUNT."
+            printf '%s\n' "$VERIFY_OUTPUT"
             exit 1
           fi
-          ACTUAL_FINGERPRINT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed -n '1p' | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+          ACTUAL_FINGERPRINT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed -n '1p' | tr -d '[:space:]')"
           if [[ "$ACTUAL_FINGERPRINT" != "$LINGMATCH_EXPECTED_CERT_SHA256" ]]; then
             echo "Release APK certificate fingerprint does not match the confirmed installed certificate."
             exit 1
