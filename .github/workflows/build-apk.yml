@@ -105,15 +105,18 @@ jobs:
             exit 1
           fi
           VERIFY_OUTPUT="$("$APKSIGNER" verify --verbose --print-certs "$APK_PATH" 2>&1)"
-          SIGNER_LINES="$(printf '%s\n' "$VERIFY_OUTPUT" | grep -Ei '^Signer #[0-9]+ certificate SHA-256 digest: [0-9a-f:]+' || true)"
-          SIGNER_FINGERPRINTS="$(printf '%s\n' "$SIGNER_LINES" | sed -E 's/^Signer #[0-9]+ certificate SHA-256 digest: //I' | tr '[:upper:]' '[:lower:]' | tr -d ':')"
-          SIGNER_COUNT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
-          if [[ "$SIGNER_COUNT" != "1" ]]; then
-            echo "Expected exactly one APK signer certificate, found $SIGNER_COUNT."
+          SIGNER_COUNT="$(printf '%s\n' "$VERIFY_OUTPUT" | sed -n -E 's/^Number of signers:[[:space:]]*([0-9]+).*$/\1/p' | head -n 1 | tr -d '[:space:]')"
+          SIGNER_LINES="$(printf '%s\n' "$VERIFY_OUTPUT" | grep -Ei 'Signer(:| #[0-9]+) certificate SHA-256 digest: [0-9a-f:]+' || true)"
+          SIGNER_FINGERPRINTS="$(printf '%s\n' "$SIGNER_LINES" | sed -E 's/^.*certificate SHA-256 digest:[[:space:]]*//I' | tr '[:upper:]' '[:lower:]' | sed 's/://g')"
+          FINGERPRINT_COUNT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
+          UNIQUE_FINGERPRINTS="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed '/^[[:space:]]*$/d' | sort -u)"
+          UNIQUE_FINGERPRINT_COUNT="$(printf '%s\n' "$UNIQUE_FINGERPRINTS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
+          if [[ "$SIGNER_COUNT" != "1" || "$FINGERPRINT_COUNT" == "0" || "$UNIQUE_FINGERPRINT_COUNT" != "1" ]]; then
+            echo "Expected one APK signer and one unique certificate fingerprint; found signers=$SIGNER_COUNT, digests=$FINGERPRINT_COUNT, unique_digests=$UNIQUE_FINGERPRINT_COUNT."
             printf '%s\n' "$VERIFY_OUTPUT"
             exit 1
           fi
-          ACTUAL_FINGERPRINT="$(printf '%s\n' "$SIGNER_FINGERPRINTS" | sed -n '1p' | tr -d '[:space:]')"
+          ACTUAL_FINGERPRINT="$UNIQUE_FINGERPRINTS"
           if [[ "$ACTUAL_FINGERPRINT" != "$LINGMATCH_EXPECTED_CERT_SHA256" ]]; then
             echo "Release APK certificate fingerprint does not match the confirmed installed certificate."
             exit 1
